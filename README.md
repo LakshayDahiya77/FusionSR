@@ -27,8 +27,6 @@ The model was trained on a combined dataset of DIV2K and Flickr2K and evaluated 
 | SwinIR-M (Baseline) | Set14 | 28.08 | 0.7701 |
 | **FusionSR (v5)** | **Set14** | **XX.XX** | **.XXXX** |
 
-*(Note: Benchmarks are placeholders to be filled in after the final fine-tuning run.)*
-
 ## Getting Started
 
 ### Prerequisites
@@ -56,8 +54,8 @@ The model was trained on a combined dataset of DIV2K and Flickr2K and evaluated 
 1.  **Organize Datasets:** Place the DIV2K, Flickr2K, and Set14 datasets in a structured folder.
 2.  **Update Paths:** Modify the paths in the configuration cell of the notebook to point to your dataset and project directories.
 3.  **Run Notebook:** The project is organized in a Jupyter/Colab notebook. You can execute the cells sequentially to train the model.
-    * *(Link to your v5 Notebook will go here)*
-    * *(Link to your v5-finetune Notebook will go here)*
+    * *(Link to v5 Notebook)*
+    * *(Link to v5-finetune Notebook)*
 
 ### Inference
 
