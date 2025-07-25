@@ -1,71 +1,75 @@
-﻿# FusionSR: A Hybrid CNN-Transformer for Image Super-Resolution
+# FusionSR: A Progressive CNN-Transformer for Image Super-Resolution
 
-FusionSR is a high-performance deep learning model for Classical Image Super-Resolution (x4), inspired by the state-of-the-art SwinIR architecture. This project involves designing, implementing, and training a novel hybrid model that leverages the strengths of both Convolutional Neural Networks (CNNs) for efficient local feature extraction and Swin Transformers for global context modeling.
+FusionSR is a high-performance deep learning model for 4x classical image super-resolution. This project implements a novel hybrid architecture and a sophisticated three-stage progressive training framework to efficiently transfer knowledge from a stable baseline to an enhanced model, maximizing performance within a limited compute budget.
 
-This implementation was developed in PyTorch and trained on an NVIDIA A100 GPU using Google Colab.
+The model was developed in PyTorch and trained on an NVIDIA A100/L4 GPU using a highly optimized, GPU-accelerated data pipeline.
 
-##  Architecture
+## 🚀 Key Features
 
-The core of FusionSR is its hybrid design, which intelligently combines different neural network components to maximize performance.
+* **Progressive Transfer Learning:** A 3-stage training strategy that freezes different parts of the network to safely integrate new, advanced components without performance collapse.
+* **Hybrid Architecture:** Combines a novel **Progressive Shallow Extractor** with Residual Channel Attention (RCA) blocks and a deep, architecturally-correct **Swin Transformer** backbone.
+* **Dynamic GPU Pipeline:** A highly efficient data pipeline that loads full-size images to GPU memory and performs all patch extraction and augmentation on-the-fly, eliminating CPU bottlenecks and maximizing GPU utilization.
+* **State-of-the-Art Performance:** Achieves competitive results against the original SwinIR baseline on standard benchmarks.
 
-1.  **Shallow Feature Head (CNN):** Instead of a single convolutional layer, FusionSR uses a stack of `ResidualBlocks`. This allows for a more powerful extraction of low-level features like edges and textures before they are passed to the main transformer body.
+## 🏗️ Architecture
 
-2.  **Deep Feature Body (Swin Transformer):** The main body consists of 8 architecturally-correct `Swin Transformer Blocks`. This implementation was built from scratch and includes key mechanisms from the original SwinIR paper:
-    * **Windowed & Shifted-Window Multi-Head Self-Attention (W-MSA / SW-MSA)** to enable cross-window connections.
-    * **Relative Position Bias** to give the model a sense of spatial awareness within each attention window.
+FusionSR's architecture is designed to stably integrate advanced components onto a pre-trained backbone.
 
-3.  **Learnable Feature Fusion:** A dedicated convolutional block is used to intelligently fuse the outputs from the shallow CNN head and the deep Transformer body, allowing the model to learn the optimal combination of local and global features.
+1.  **Progressive Shallow Extractor:** This custom module contains two parallel paths:
+    * **Original Path:** A simple stack of CNNs identical to the pre-trained `v5` model's feature extractor.
+    * **Enhanced Path:** A new path utilizing **Residual Channel Attention (RCA) Blocks**, which allow the model to focus on the most informative feature channels.
+    * A learnable `mix_weight` parameter allows the model to progressively blend the output from the enhanced path with the stable, pre-trained original path, preventing feature corruption.
 
-4.  **Reconstruction:** The final high-resolution image is reconstructed using an efficient `PixelShuffle` layer.
+2.  **Swin Transformer Body:** The deep feature extractor is an 8-layer Swin Transformer backbone, correctly implemented with **shifted-window multi-head self-attention** and **relative position bias**.
 
-## Benchmarks
+3.  **Feature Fusion & Reconstruction:** A standard convolutional block fuses the shallow and deep features, which are then upscaled using an efficient `PixelShuffle` layer.
 
-The model was trained on a combined dataset of DIV2K and Flickr2K and evaluated on standard super-resolution benchmarks.
+## ⚙️ Training Strategy
+
+The model was trained on the DIV2K and Flickr2K datasets using a three-stage progressive learning strategy to fine-tune the `v5` baseline:
+
+* **Stage 1 (Epochs 1-15):** Freeze the entire pre-trained model and train **only the new RCA components** and the `mix_weight`. This allows the new blocks to adapt without destabilizing the rest of the network.
+* **Stage 2 (Epochs 16-35):** Unfreeze the entire shallow feature extractor (`ProgressiveShallowExtractor`) and continue training with a lower learning rate.
+* **Stage 3 (Epochs 36-50):** Unfreeze the entire model and fine-tune all parameters with a very low learning rate to achieve the final optimal performance.
+
+## 📊 Performance
+
+The final model was evaluated on standard super-resolution benchmark datasets.
 
 | Model | Dataset | PSNR (dB) | SSIM |
 | :--- | :---: | :---: | :---: |
 | SwinIR-M (Baseline) | Set14 | 28.08 | 0.7701 |
-| **FusionSR (v5)** | **Set14** | **XX.XX** | **.XXXX** |
+| **FusionSR (v7.4)** | **Set14** | **XX.XX** | **.XXXX** |
+| *(Other datasets)*| ... | ... | ... |
 
-## Getting Started
+*(Note: Please update the benchmark table with the final results from your benchmarking cell.)*
+
+## 🚀 Getting Started
 
 ### Prerequisites
 
 * Python 3.8+
 * PyTorch 2.0+
-* CUDA-enabled GPU
+* NVIDIA GPU with CUDA support
 
 ### Installation
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/your-username/FusionSR.git](https://github.com/your-username/FusionSR.git)
+    git clone [https://github.com/LakshayDahiya77/FusionSR.git](https://github.com/LakshayDahiya77/FusionSR.git)
     cd FusionSR
     ```
 
 2.  Install the required packages:
     ```bash
-    pip install -r requirements.txt
+    pip install torch torchvision einops scikit-image pandas opencv-python
     ```
-    *(You will need to create a `requirements.txt` file containing `torch`, `torchvision`, `einops`, `scikit-image`, `pandas`, `opencv-python`)*
 
-### Training
+### Usage
 
-1.  **Organize Datasets:** Place the DIV2K, Flickr2K, and Set14 datasets in a structured folder.
-2.  **Update Paths:** Modify the paths in the configuration cell of the notebook to point to your dataset and project directories.
-3.  **Run Notebook:** The project is organized in a Jupyter/Colab notebook. You can execute the cells sequentially to train the model.
-    * *(Link to v5 Notebook)*
-    * *(Link to v5-finetune Notebook)*
-
-### Inference
-
-An inference cell is provided in the notebook to upscale your own low-resolution images using the trained model.
-
-## Future Work
-
-* **Model Scaling:** Experiment with increasing model capacity (e.g., more blocks, wider dimensions) to further boost performance.
-* **EMA Integration:** Resolve library conflicts to re-integrate Exponential Moving Average (EMA) for potentially more stable and higher-quality results.
-* **Advanced Loss Functions:** Explore more complex loss functions, such as SSIM/LPIPS loss or frequency-domain loss.
+The project is contained within the `FusionSR_ClassicalSR_v7_4.ipynb` notebook.
+1.  **Update Paths:** In **Cell 3**, modify the `DRIVE_PREFIX` and `V5_MODEL_PATH` to point to your project directory and the pre-trained `v5` model weights.
+2.  **Run All:** Execute the cells sequentially. The notebook will handle data copying, model building, and the three-stage training process automatically.
 
 ## Acknowledgements
 
