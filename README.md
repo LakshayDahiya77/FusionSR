@@ -15,13 +15,13 @@ The model was developed in PyTorch and trained on an NVIDIA A100/L4 GPU using a 
 
 The final model was evaluated on standard super-resolution benchmark datasets. While it establishes a strong performance baseline for a custom architecture, it does not surpass the highly-optimized SwinIR model.
 
-| Model               | Dataset   | PSNR (dB) |  SSIM  |
-| :------------------ | :-------: | :-------: | :----: |
-| SwinIR-M (Baseline) |   Set14   |   28.08   | 0.7701 |
-| **FusionSR (Final)**| **Set5** | **25.150**| **0.7466** |
-| **FusionSR (Final)**| **Set14** | **23.533**| **0.6849** |
-| **FusionSR (Final)**| **BSD100**| **24.544**| **0.6830** |
-| **FusionSR (Final)**|**Urban100**| **21.591**| **0.6484** |
+| Dataset   | Images | FusionSR V7 (PSNR / SSIM) | SwinIR (PSNR / SSIM)    |
+|-----------|:------:|----------------------------|--------------------------|
+| Set5      |   15   | 25.150 / 0.7466            | 30.89 / 0.8877           |
+| Set14     |   42   | 23.533 / 0.6849            | 27.01 / 0.7787           |
+| BSD100    |  300   | 24.544 / 0.6830            | 26.60 / 0.7474           |
+| Urban100  |  300   | 21.591 / 0.6484            | 25.87 / 0.8197           |
+
 
 ## 🏗️ Architecture
 
