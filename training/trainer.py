@@ -2,7 +2,6 @@ import os
 import math
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
 import wandb
 from utils.metrics import psnr, ssim
 
@@ -43,7 +42,7 @@ class Trainer:
         self.config = config
         self.device = device
         self.save_dir = save_dir
-        self.scaler = GradScaler()
+        self.scaler = torch.amp.GradScaler("cuda")
 
         self.best_psnr = 0.0
         self.start_epoch = 0
@@ -81,11 +80,6 @@ class Trainer:
     # ── validation ────────────────────────
     @torch.no_grad()
     def validate(self, num_samples: int = 5) -> dict:
-        """
-        Runs validation on full images (no cropping).
-        Computes PSNR and SSIM averaged over the validation set.
-        Collects sample images for W&B logging.
-        """
         self.model.eval()
         total_psnr = 0.0
         total_ssim = 0.0
@@ -95,19 +89,31 @@ class Trainer:
             lr_imgs = lr_imgs.to(self.device)
             hr_imgs = hr_imgs.to(self.device)
 
+            # pad LR so H and W are divisible by window_size
+            _, _, h, w = lr_imgs.shape
+            window_size = 8
+            pad_h = (window_size - h % window_size) % window_size
+            pad_w = (window_size - w % window_size) % window_size
+            if pad_h > 0 or pad_w > 0:
+                lr_imgs = torch.nn.functional.pad(
+                    lr_imgs, (0, pad_w, 0, pad_h), mode="reflect"
+                )
+
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 pred = self.model(lr_imgs).float().clamp(0, 1)
 
-            hr_imgs = hr_imgs.float()
+            # crop prediction back to original HR size
+            hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
+            pred = pred[:, :, :hr_h, :hr_w]
 
+            hr_imgs = hr_imgs.float()
             total_psnr += psnr(pred, hr_imgs)
             total_ssim += ssim(pred, hr_imgs)
 
-            # collect first N samples for W&B
             if i < num_samples:
                 samples.append(
                     {
-                        "lr": lr_imgs[0].cpu(),
+                        "lr": lr_imgs[:, :, :h, :w][0].cpu(),
                         "sr": pred[0].cpu(),
                         "hr": hr_imgs[0].cpu(),
                     }
