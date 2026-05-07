@@ -283,3 +283,90 @@ class SwinBlockPair(nn.Module):
         x = self.w_msa(x, attn_mask=None)
         x = self.sw_msa(x, attn_mask=self._attn_mask)
         return x
+
+
+# ─────────────────────────────────────────
+#  Dual-Path Shallow Feature Extractor
+# ─────────────────────────────────────────
+class DualPathExtractor(nn.Module):
+    """
+    Two parallel paths for shallow feature extraction (from FusionSR).
+
+    Path A — general: simple conv stack, fast, low-level features
+    Path B — attention: same but with two RCAB blocks for richer features
+
+    Output is a learned weighted blend:
+        out = (1 - sigmoid(w)) * A + sigmoid(w) * B
+        w initialized to -2.0 → sigmoid ≈ 0.12 (mostly Path A early in training)
+
+    The network learns how much to rely on the attention path.
+
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+
+        # Path A — general
+        self.path_a = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, 1, bias=True),
+        )
+
+        # Path B — attention enhanced
+        self.path_b = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=True),
+            nn.GELU(),
+            RCAB(out_channels),
+            RCAB(out_channels),
+            nn.Conv2d(out_channels, out_channels, 1, bias=True),
+        )
+
+        # learnable mixing scalar — init at -2.0 so sigmoid ≈ 0.12
+        self.mix_weight = nn.Parameter(torch.tensor(-2.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = self.path_a(x)
+        b = self.path_b(x)
+        mix = torch.sigmoid(self.mix_weight)
+        return (1.0 - mix) * a + mix * b
+
+
+# ─────────────────────────────────────────
+#  Residual Group
+# ─────────────────────────────────────────
+class ResidualGroup(nn.Module):
+    """
+    One residual group — the repeating unit of Stage 2.
+
+    Structure:
+        4x RCAB blocks  (local features, channel attention)
+        1x SwinBlockPair (global context, shifted window attention)
+        Conv 3x3
+        Group-level skip connection
+
+    The group-level skip means the entire group only needs to
+    learn a residual, not a full transformation.
+
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        window_size: int,
+        num_heads: int,
+        num_rcab: int = 4,
+    ):
+        super().__init__()
+
+        self.rcab_blocks = nn.Sequential(*[RCAB(channels) for _ in range(num_rcab)])
+        self.swin_pair = SwinBlockPair(channels, window_size, num_heads)
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.rcab_blocks(x)
+        res = self.swin_pair(res)
+        res = self.conv(res)
+        return x + res  # group skip
