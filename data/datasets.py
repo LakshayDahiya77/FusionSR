@@ -64,52 +64,52 @@ def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
 # ─────────────────────────────────────────
 class DIV2KDatasetFast(Dataset):
     """
-    Pre-loads all images into RAM as numpy arrays at init time.
-    Zero disk/decode overhead during training — pure RAM reads.
-    Random crop is done on CPU tensors, augmentation on GPU in trainer.
+    Pre-loads all LR images into RAM (small, safe).
+    HR images loaded lazily from RAM disk (fast enough — already in /dev/shm).
+
     """
 
-    def __init__(
-        self,
-        hr_dir: str,
-        lr_dir: str,
-        patch_lr: int = 64,
-        training: bool = True,
-    ):
+    def __init__(self, hr_dir, lr_dir, patch_lr=64, training=True):
         super().__init__()
         self.patch_lr = patch_lr
         self.training = training
+        self.hr_dir = Path(hr_dir)
 
         hr_files = sorted(Path(hr_dir).glob("*.png"))
-        assert len(hr_files) > 0, f"No PNG files in {hr_dir}"
+        assert len(hr_files) > 0
 
-        print(f"pre-loading {len(hr_files)} image pairs...", end=" ")
-        self.hr_images = []
+        print(f"pre-loading {len(hr_files)} LR images...", end=" ", flush=True)
         self.lr_images = []
+        self.hr_paths = []
 
         for hr_path in hr_files:
             lr_path = Path(lr_dir) / f"{hr_path.stem}x4.png"
-            hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
+            # pre-load LR only — small images, safe
             lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
-            self.hr_images.append(hr)
             self.lr_images.append(lr)
+            self.hr_paths.append(hr_path)  # HR loaded lazily
 
-        print(f"done. {len(self.hr_images)} pairs in memory.")
+        print(f"done.")
 
-    def __len__(self) -> int:
-        return len(self.hr_images)
+    def __len__(self):
+        return len(self.lr_images)
 
-    def __getitem__(self, idx: int):
-        # direct RAM access — no disk read
-        hr = torch.from_numpy(self.hr_images[idx]).permute(2, 0, 1)  # [3, H, W]
-        lr = torch.from_numpy(self.lr_images[idx]).permute(2, 0, 1)  # [3, H, W]
+    def __getitem__(self, idx):
+        lr = torch.from_numpy(self.lr_images[idx]).permute(2, 0, 1)
+
+        # load HR from RAM disk lazily — fast since /dev/shm is in memory
+        hr = (
+            np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.float32)
+            / 255.0
+        )
+        hr = torch.from_numpy(hr).permute(2, 0, 1)
 
         if self.training:
             lr, hr = self._random_crop(lr, hr)
 
         return lr, hr
 
-    def _random_crop(self, lr: torch.Tensor, hr: torch.Tensor):
+    def _random_crop(self, lr, hr):
         _, h, w = lr.shape
         p = self.patch_lr
 
