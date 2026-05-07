@@ -3,26 +3,17 @@ import random
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import functional as TF
+import numpy as np
 from PIL import Image
 
 
 class DIV2KDataset(Dataset):
     """
-    DIV2K dataset for 4x SR training.
-
-    HR images live in hr_dir as 0001.png ... 0800.png
-    LR images live in lr_dir as 0001x4.png ... 0800x4.png
-
-    During training:
-        - randomly crops a patch of size (patch_lr x patch_lr) from LR
-        - crops the corresponding (patch_lr*4 x patch_lr*4) region from HR
-        - applies random horizontal flip and random 90-degree rotation (augmentation)
-
-    During validation:
-        - returns full images, no cropping or augmentation
-        - used to compute PSNR / SSIM on complete images
+    DIV2K dataset with RAM disk loading.
+    Images are pre-loaded as numpy arrays for fast access.
+    Augmentation (crop, flip, rotate) is done on GPU tensors.
 
     """
 
@@ -30,7 +21,7 @@ class DIV2KDataset(Dataset):
         self,
         hr_dir: str,
         lr_dir: str,
-        patch_lr: int = 64,  # LR patch size, HR patch = patch_lr * 4
+        patch_lr: int = 64,
         training: bool = True,
     ):
         super().__init__()
@@ -39,73 +30,77 @@ class DIV2KDataset(Dataset):
         self.patch_lr = patch_lr
         self.training = training
 
-        # collect all HR filenames, derive LR names from them
         self.hr_files = sorted(self.hr_dir.glob("*.png"))
-        assert len(self.hr_files) > 0, f"No PNG files found in {hr_dir}"
+        assert len(self.hr_files) > 0, f"No PNG files in {hr_dir}"
 
     def __len__(self) -> int:
         return len(self.hr_files)
 
     def __getitem__(self, idx: int):
         hr_path = self.hr_files[idx]
+        lr_path = self.lr_dir / f"{hr_path.stem}x4.png"
 
-        # derive LR filename: 0001.png → 0001x4.png
-        stem = hr_path.stem  # "0001"
-        lr_path = self.lr_dir / f"{stem}x4.png"
+        # load as numpy — faster than PIL for large images
+        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
+        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
 
-        hr = Image.open(hr_path).convert("RGB")
-        lr = Image.open(lr_path).convert("RGB")
+        # numpy HWC → torch CHW
+        hr = torch.from_numpy(hr).permute(2, 0, 1)  # [3, H, W]
+        lr = torch.from_numpy(lr).permute(2, 0, 1)  # [3, H, W]
 
         if self.training:
             lr, hr = self._random_crop(lr, hr)
-            lr, hr = self._augment(lr, hr)
-
-        # PIL → tensor, values in [0, 1]
-        lr = TF.to_tensor(lr)  # [3, H, W]
-        hr = TF.to_tensor(hr)  # [3, H*4, W*4]
+            # augmentation happens on GPU — return as-is here
+            # GPU aug is applied in trainer via collate
 
         return lr, hr
 
-    def _random_crop(self, lr: Image.Image, hr: Image.Image):
-        lr_w, lr_h = lr.size
+    def _random_crop(self, lr: torch.Tensor, hr: torch.Tensor):
+        _, h, w = lr.shape
         p = self.patch_lr
 
-        # make sure image is large enough
-        if lr_w < p or lr_h < p:
-            lr = TF.resize(
-                lr,
-                (max(lr_h, p), max(lr_w, p)),
-                interpolation=TF.InterpolationMode.BICUBIC,
-            )
-            hr = TF.resize(
-                hr,
-                (max(lr_h, p) * 4, max(lr_w, p) * 4),
-                interpolation=TF.InterpolationMode.BICUBIC,
-            )
-            lr_w, lr_h = lr.size
+        if h < p or w < p:
+            # pad if needed
+            ph = max(0, p - h)
+            pw = max(0, p - w)
+            lr = F.pad(lr, (0, pw, 0, ph))
+            hr = F.pad(hr, (0, pw * 4, 0, ph * 4))
+            _, h, w = lr.shape
 
-        # random top-left corner in LR space
-        x = random.randint(0, lr_w - p)
-        y = random.randint(0, lr_h - p)
+        x = random.randint(0, w - p)
+        y = random.randint(0, h - p)
 
-        lr_crop = TF.crop(lr, y, x, p, p)
-        hr_crop = TF.crop(hr, y * 4, x * 4, p * 4, p * 4)
-
-        return lr_crop, hr_crop
-
-    def _augment(self, lr: Image.Image, hr: Image.Image):
-        # random horizontal flip
-        if random.random() > 0.5:
-            lr = TF.hflip(lr)
-            hr = TF.hflip(hr)
-
-        # random 90-degree rotation (0, 90, 180, 270)
-        k = random.randint(0, 3)
-        if k > 0:
-            lr = TF.rotate(lr, 90 * k)
-            hr = TF.rotate(hr, 90 * k)
+        lr = lr[:, y : y + p, x : x + p]
+        hr = hr[:, y * 4 : y * 4 + p * 4, x * 4 : x * 4 + p * 4]
 
         return lr, hr
+
+
+def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
+    """
+    Apply random flip and rotation on GPU tensors.
+    lr: [B, 3, H, W]
+    hr: [B, 3, H*4, W*4]
+    Both on CUDA.
+
+    """
+    # random horizontal flip
+    if random.random() > 0.5:
+        lr = torch.flip(lr, dims=[-1])
+        hr = torch.flip(hr, dims=[-1])
+
+    # random vertical flip
+    if random.random() > 0.5:
+        lr = torch.flip(lr, dims=[-2])
+        hr = torch.flip(hr, dims=[-2])
+
+    # random 90-degree rotation (0, 90, 180, 270)
+    k = random.randint(0, 3)
+    if k > 0:
+        lr = torch.rot90(lr, k, dims=[-2, -1])
+        hr = torch.rot90(hr, k, dims=[-2, -1])
+
+    return lr, hr
 
 
 def make_dataloaders(
@@ -114,7 +109,7 @@ def make_dataloaders(
     valid_hr: str,
     valid_lr: str,
     patch_lr: int = 64,
-    batch_size: int = 16,
+    batch_size: int = 32,
     num_workers: int = 4,
 ):
     train_ds = DIV2KDataset(train_hr, train_lr, patch_lr=patch_lr, training=True)
@@ -125,15 +120,17 @@ def make_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=True,  # faster CPU→GPU transfer
         drop_last=True,
+        persistent_workers=True,
     )
     valid_dl = DataLoader(
         valid_ds,
-        batch_size=1,  # full images, one at a time
+        batch_size=1,
         shuffle=False,
         num_workers=2,
         pin_memory=True,
+        persistent_workers=True,
     )
 
     return train_dl, valid_dl
