@@ -8,6 +8,26 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
 
+import shutil
+
+
+def setup_ramdisk(src_dirs: dict, ramdisk: str = "/dev/shm/div2k") -> dict:
+    os.makedirs(ramdisk, exist_ok=True)
+    dst_dirs = {}
+    for name, src in src_dirs.items():
+        dst = os.path.join(ramdisk, name)
+        if os.path.exists(dst):
+            print(f"{name}: already in RAM disk")
+            dst_dirs[name] = dst
+            continue
+        print(f"copying {name}...", end=" ")
+        shutil.copytree(src, dst)
+        print(f"done ({len(os.listdir(dst))} files)")
+        dst_dirs[name] = dst
+    stat = shutil.disk_usage("/dev/shm")
+    print(f"RAM disk: {stat.used/1024**3:.2f}GB / {stat.total/1024**3:.2f}GB")
+    return dst_dirs
+
 
 class DIV2KDataset(Dataset):
     """
