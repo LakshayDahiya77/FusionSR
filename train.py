@@ -6,7 +6,12 @@ from kaggle_secrets import UserSecretsClient
 from training.trainer import Trainer
 from models.fusionsr import FusionSR
 from models.losses import CharbonnierLoss
-from data.datasets import make_train_dataloader, make_benchmark_loader, setup_ramdisk
+from data.datasets import (
+    make_train_dataloader,
+    make_combined_dataloader,
+    make_benchmark_loader,
+    setup_ramdisk,
+)
 from training.trainer import Trainer
 
 # ─────────────────────────────────────────
@@ -35,6 +40,7 @@ CONFIG = {
     "validate_every": 5,
     # data
     "div2k_base": "/kaggle/input/datasets/takihasan/div2k-dataset-for-super-resolution/Dataset",
+    "flickr_base": "/kaggle/input/datasets/hliang001/flickr2k/Flickr2K",
     # wandb
     "wandb_project": "FusionSR",
     "wandb_run": "phase1-div2k-full",  # used only for fresh runs
@@ -77,23 +83,26 @@ def main():
     print(f"W&B run ID: {run.id}")
 
     # ── RAM disk ──
-    base = CONFIG["div2k_base"]
+    div2k_base = CONFIG["div2k_base"]
+    flickr_base = CONFIG["flickr_base"]
     dst = setup_ramdisk(
         {
-            "train_hr": f"{base}/DIV2K_train_HR",
-            "train_lr": f"{base}/DIV2K_train_LR_bicubic_X4/X4",
+            "train_hr": f"{div2k_base}/DIV2K_train_HR",
+            "train_lr": f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
+            "flickr_hr": f"{flickr_base}/Flickr2K_HR",
+            "flickr_lr": f"{flickr_base}/Flickr2K_LR_bicubic/X4",
         }
     )
-
     # ── dataloaders ──
-    train_dl = make_train_dataloader(
-        train_hr=dst["train_hr"],
-        train_lr=dst["train_lr"],
+    train_dl = make_combined_dataloader(
+        div2k_hr=dst["train_hr"],
+        div2k_lr=dst["train_lr"],
+        flickr_hr=dst["flickr_hr"],
+        flickr_lr=dst["flickr_lr"],
         patch_lr=CONFIG["patch_lr"],
         batch_size=CONFIG["batch_size"],
         num_workers=CONFIG["num_workers"],
     )
-
     # validation dataloader — Set5
     bench_base = CONFIG["bench_base"]
     valid_dl = make_benchmark_loader(

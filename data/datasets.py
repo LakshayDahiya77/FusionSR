@@ -2,7 +2,7 @@ import os
 import shutil
 import random
 from pathlib import Path
-
+from torch.utils.data import ConcatDataset
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -170,6 +170,42 @@ class DIV2KDataset(Dataset):
 # ─────────────────────────────────────────
 #  Dataloaders
 # ─────────────────────────────────────────
+
+
+def make_combined_dataloader(
+    div2k_hr: str,
+    div2k_lr: str,
+    flickr_hr: str,
+    flickr_lr: str,
+    patch_lr: int = 64,
+    batch_size: int = 32,
+    num_workers: int = 4,
+):
+    """
+    Combined DIV2K + Flickr2K training dataloader.
+    DIV2K: 800 images, Flickr2K: 2650 images → 3450 total.
+    """
+    div2k_ds = DIV2KDatasetFast(div2k_hr, div2k_lr, patch_lr=patch_lr, training=True)
+    flickr_ds = DIV2KDatasetFast(flickr_hr, flickr_lr, patch_lr=patch_lr, training=True)
+
+    combined = ConcatDataset([div2k_ds, flickr_ds])
+    print(
+        f"combined dataset: {len(combined)} images "
+        f"({len(div2k_ds)} DIV2K + {len(flickr_ds)} Flickr2K)"
+    )
+
+    return DataLoader(
+        combined,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,
+    )
+
+
+setup_ramdisk
 
 
 def make_train_dataloader(
