@@ -6,7 +6,7 @@ from kaggle_secrets import UserSecretsClient
 
 from models.fusionsr import FusionSR
 from models.losses import CharbonnierLoss
-from data.datasets import make_dataloaders_fast, setup_ramdisk
+from data.datasets import make_dataloaders_fast, make_benchmark_loader, setup_ramdisk
 from training.trainer import Trainer
 
 # ─────────────────────────────────────────
@@ -22,6 +22,8 @@ CONFIG = {
     "window_size": 8,
     "num_heads": 4,
     "scale": 4,
+    # benchmarks
+    "bench_base": "/kaggle/input/datasets/jesucristo/super-resolution-benchmarks",
     # training
     "epochs": 150,
     "lr_max": 2e-4,
@@ -73,15 +75,23 @@ def main():
     )
 
     # ── dataloaders ──
-    train_dl, valid_dl = make_dataloaders_fast(
+    train_dl, _ = make_dataloaders_fast(
         train_hr=dst["train_hr"],
         train_lr=dst["train_lr"],
-        valid_hr=dst["valid_hr"],
-        valid_lr=dst["valid_lr"],
+        valid_hr=dst["train_hr"],  # dummy, not used
+        valid_lr=dst["train_lr"],  # dummy, not used
         patch_lr=CONFIG["patch_lr"],
         batch_size=CONFIG["batch_size"],
         num_workers=CONFIG["num_workers"],
     )
+
+    # validation dataloader — Set5
+    bench_base = CONFIG["bench_base"]
+    valid_dl = make_benchmark_loader(
+        hr_dir=f"{bench_base}/Set5/Set5/GTmod12",
+        lr_dir=f"{bench_base}/Set5/Set5/LRbicx4",
+    )
+
     print(f"train batches: {len(train_dl)} | valid images: {len(valid_dl)}")
 
     # ── model ──

@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 from utils.metrics import psnr, ssim
+import wandb
 
 
 # ─────────────────────────────────────────
@@ -215,7 +216,10 @@ class Trainer:
             # validate
             if (epoch + 1) % validate_every == 0 or epoch == 0:
                 t0 = time.time()
-                metrics = self.validate()
+
+                # Set5 validation — fast, full images, proper methodology
+                metrics = self.validate_benchmark(self.valid_dl, "Set5")
+
                 val_time = time.time() - t0
 
                 log_dict.update(
@@ -260,3 +264,47 @@ class Trainer:
 
         print("-" * 50)
         print(f"training complete. best PSNR: {self.best_psnr:.2f}dB")
+
+    @torch.no_grad()
+    def validate_benchmark(self, benchmark_dl, name: str) -> dict:
+        """
+        Full image validation on benchmark datasets (Set5, Set14).
+        Pads to window size, runs full image, crops boundary before metrics.
+        """
+        self.model.eval()
+        total_psnr = 0.0
+        total_ssim = 0.0
+        window_size = self.config["window_size"]
+        scale = self.config["scale"]
+
+        for lr_imgs, hr_imgs, _ in benchmark_dl:
+            lr_imgs = lr_imgs.to(self.device)
+            hr_imgs = hr_imgs.to(self.device).float()
+
+            # pad to window size
+            _, _, h, w = lr_imgs.shape
+            pad_h = (window_size - h % window_size) % window_size
+            pad_w = (window_size - w % window_size) % window_size
+            if pad_h > 0 or pad_w > 0:
+                lr_imgs = torch.nn.functional.pad(
+                    lr_imgs, (0, pad_w, 0, pad_h), mode="reflect"
+                )
+
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                pred = self.model(lr_imgs).float().clamp(0, 1)
+
+            # crop to original HR size
+            hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
+            pred = pred[:, :, :hr_h, :hr_w]
+
+            # boundary crop before metrics (standard SR evaluation)
+            # removes scale pixels from each edge
+            b = scale
+            pred = pred[:, :, b:-b, b:-b]
+            hr_imgs = hr_imgs[:, :, b:-b, b:-b]
+
+            total_psnr += psnr(pred, hr_imgs)
+            total_ssim += ssim(pred, hr_imgs)
+
+        n = len(benchmark_dl)
+        return {"psnr": total_psnr / n, "ssim": total_ssim / n}

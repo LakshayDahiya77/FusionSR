@@ -232,3 +232,38 @@ def make_dataloaders(
     )
 
     return train_dl, valid_dl
+
+
+class BenchmarkDataset(Dataset):
+    """
+    Dataset for standard SR benchmarks (Set5, Set14).
+    Uses pre-paired LR/HR images from the benchmark dataset.
+    HR: GTmod12 folder
+    LR: LRbicx4 folder
+    """
+
+    def __init__(self, hr_dir: str, lr_dir: str):
+        super().__init__()
+        self.hr_files = sorted(Path(hr_dir).glob("*.png"))
+        self.lr_dir = Path(lr_dir)
+        assert len(self.hr_files) > 0, f"No PNG files in {hr_dir}"
+
+    def __len__(self):
+        return len(self.hr_files)
+
+    def __getitem__(self, idx):
+        hr_path = self.hr_files[idx]
+        lr_path = self.lr_dir / hr_path.name  # same filename in LR folder
+
+        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
+        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
+
+        hr = torch.from_numpy(hr).permute(2, 0, 1)
+        lr = torch.from_numpy(lr).permute(2, 0, 1)
+
+        return lr, hr, hr_path.name  # return filename for logging
+
+
+def make_benchmark_loader(hr_dir: str, lr_dir: str):
+    ds = BenchmarkDataset(hr_dir, lr_dir)
+    return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
