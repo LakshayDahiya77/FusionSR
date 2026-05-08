@@ -48,6 +48,14 @@ class Trainer:
         self.best_psnr = 0.0
         self.start_epoch = 0
 
+        # SGDR scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=config["sgdr_t0"],
+            T_mult=1,
+            eta_min=config["lr_min"],
+        )
+
         os.makedirs(save_dir, exist_ok=True)
 
     # ── training ──────────────────────────
@@ -131,6 +139,7 @@ class Trainer:
                 "epoch": epoch,
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),  # ← added
                 "scaler": self.scaler.state_dict(),
                 "best_psnr": self.best_psnr,
                 "config": self.config,
@@ -139,7 +148,6 @@ class Trainer:
             path,
         )
 
-        # upload to W&B as artifact
         artifact = wandb.Artifact(
             name=f"fusionsr-{tag}", type="model", metadata={"epoch": epoch, **metrics}
         )
@@ -161,6 +169,8 @@ class Trainer:
         self.model.load_state_dict(ckpt["model"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scaler.load_state_dict(ckpt["scaler"])
+        if "scheduler" in ckpt:
+            self.scheduler.load_state_dict(ckpt["scheduler"])
         self.best_psnr = ckpt["best_psnr"]
         self.start_epoch = ckpt["epoch"] + 1
         print(f"resumed from epoch {ckpt['epoch']} | best PSNR {self.best_psnr:.2f}dB")
@@ -190,37 +200,33 @@ class Trainer:
 
     # ── main loop ─────────────────────────
     def fit(self, epochs: int, lr_max: float, lr_min: float, validate_every: int = 5):
-
         print(f"starting training for {epochs} epochs")
-        print(f"LR: {lr_max} → {lr_min} (cosine)")
+        print(f"SGDR T0={self.config['sgdr_t0']} | LR {lr_max} → {lr_min}")
         print(f"validating every {validate_every} epochs")
         print("-" * 50)
 
         for epoch in range(self.start_epoch, self.start_epoch + epochs):
 
-            lr = cosine_lr(
-                self.optimizer, epoch, self.start_epoch + epochs, lr_max, lr_min
-            )
+            # get current LR before step
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
-            # train
             t0 = time.time()
             train_loss = self.train_epoch(epoch)
             train_time = time.time() - t0
 
+            # step scheduler after each epoch
+            self.scheduler.step()
+
             log_dict = {
                 "train/loss": train_loss,
-                "train/lr": lr,
+                "train/lr": current_lr,
                 "time/train_epoch": train_time,
                 "epoch": epoch,
             }
 
-            # validate
             if (epoch + 1) % validate_every == 0 or epoch == 0:
                 t0 = time.time()
-
-                # Set5 validation — fast, full images, proper methodology
                 metrics = self.validate_benchmark(self.valid_dl, "Set5")
-
                 val_time = time.time() - t0
 
                 log_dict.update(
@@ -242,14 +248,16 @@ class Trainer:
                         f"epoch {epoch:4d} | loss {train_loss:.4f} | "
                         f"PSNR {metrics['psnr']:.2f}dB ← best | "
                         f"SSIM {metrics['ssim']:.4f} | "
-                        f"train {train_time:.0f}s | val {val_time:.0f}s"
+                        f"train {train_time:.0f}s | val {val_time:.0f}s | "
+                        f"LR {current_lr:.2e}"
                     )
                 else:
                     print(
                         f"epoch {epoch:4d} | loss {train_loss:.4f} | "
                         f"PSNR {metrics['psnr']:.2f}dB | "
                         f"SSIM {metrics['ssim']:.4f} | "
-                        f"train {train_time:.0f}s | val {val_time:.0f}s"
+                        f"train {train_time:.0f}s | val {val_time:.0f}s | "
+                        f"LR {current_lr:.2e}"
                     )
 
                 self.save_checkpoint(epoch, metrics, tag="latest")
@@ -258,7 +266,7 @@ class Trainer:
                 log_dict["time/total_epoch"] = train_time
                 print(
                     f"epoch {epoch:4d} | loss {train_loss:.4f} | "
-                    f"train {train_time:.0f}s | LR {lr:.2e}"
+                    f"train {train_time:.0f}s | LR {current_lr:.2e}"
                 )
 
             wandb.log(log_dict, step=epoch)

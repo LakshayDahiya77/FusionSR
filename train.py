@@ -3,7 +3,7 @@ import sys
 import torch
 import wandb
 from kaggle_secrets import UserSecretsClient
-
+from training.trainer import Trainer
 from models.fusionsr import FusionSR
 from models.losses import CharbonnierLoss
 from data.datasets import make_train_dataloader, make_benchmark_loader, setup_ramdisk
@@ -25,9 +25,10 @@ CONFIG = {
     # benchmarks
     "bench_base": "/kaggle/input/datasets/jesucristo/super-resolution-benchmarks",
     # training
-    "epochs": 150,
+    "epochs": 50,
     "lr_max": 2e-4,
     "lr_min": 1e-6,
+    "sgdr_t0": 50,  # ← new: SGDR restart period
     "batch_size": 32,
     "patch_lr": 64,
     "num_workers": 4,
@@ -36,10 +37,12 @@ CONFIG = {
     "div2k_base": "/kaggle/input/datasets/takihasan/div2k-dataset-for-super-resolution/Dataset",
     # wandb
     "wandb_project": "FusionSR",
-    "wandb_run": "phase1-div2k",
+    "wandb_run": "phase1-div2k-full",  # used only for fresh runs
+    "wandb_run_id": None,  # ← new: set when resuming to continue same chart
+    # resume
+    "resume": None,  # None | 'wandb'
     # paths
     "save_dir": "/kaggle/working/checkpoints",
-    "resume": None,  # set to checkpoint path to resume, e.g. '.../fusionsr_latest.pt'
 }
 
 
@@ -57,11 +60,21 @@ def main():
     # ── W&B ──
     secrets = UserSecretsClient()
     wandb.login(key=secrets.get_secret("WANDB_API_KEY"))
-    wandb.init(
-        project=CONFIG["wandb_project"],
-        name=CONFIG["wandb_run"],
-        config=CONFIG,
-    )
+
+    if CONFIG["resume"] and CONFIG["wandb_run_id"]:
+        run = wandb.init(
+            project=CONFIG["wandb_project"],
+            id=CONFIG["wandb_run_id"],
+            resume="must",
+        )
+    else:
+        run = wandb.init(
+            project=CONFIG["wandb_project"],
+            name=CONFIG["wandb_run"],
+            config=CONFIG,
+        )
+
+    print(f"W&B run ID: {run.id}")
 
     # ── RAM disk ──
     base = CONFIG["div2k_base"]
@@ -122,7 +135,7 @@ def main():
         save_dir=CONFIG["save_dir"],
     )
 
-    # ── resume if specified ──
+    # ── resume ──
     if CONFIG["resume"] == "wandb":
         ckpt_path = Trainer.download_checkpoint(CONFIG["wandb_project"])
         trainer.load_checkpoint(ckpt_path)
