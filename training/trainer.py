@@ -1,8 +1,8 @@
 import os
+import time
 import math
 import torch
 import torch.nn as nn
-import wandb
 from utils.metrics import psnr, ssim
 
 
@@ -142,6 +142,22 @@ class Trainer:
             path,
         )
 
+        # upload to W&B as artifact
+        artifact = wandb.Artifact(
+            name=f"fusionsr-{tag}", type="model", metadata={"epoch": epoch, **metrics}
+        )
+        artifact.add_file(path)
+        wandb.log_artifact(artifact)
+
+    def download_checkpoint(run_path: str, tag: str = "latest") -> str:
+        """
+        Download checkpoint from W&B.
+        run_path: e.g. 'lakshay_dahiya77/FusionSR'
+        """
+        artifact = wandb.use_artifact(f"fusionsr-{tag}:latest", type="model")
+        artifact_dir = artifact.download()
+        return os.path.join(artifact_dir, f"fusionsr_{tag}.pt")
+
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["model"])
@@ -176,6 +192,7 @@ class Trainer:
 
     # ── main loop ─────────────────────────
     def fit(self, epochs: int, lr_max: float, lr_min: float, validate_every: int = 5):
+
         print(f"starting training for {epochs} epochs")
         print(f"LR: {lr_max} → {lr_min} (cosine)")
         print(f"validating every {validate_every} epochs")
@@ -183,61 +200,67 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.start_epoch + epochs):
 
-            # update LR
             lr = cosine_lr(
                 self.optimizer, epoch, self.start_epoch + epochs, lr_max, lr_min
             )
 
             # train
+            t0 = time.time()
             train_loss = self.train_epoch(epoch)
+            train_time = time.time() - t0
 
-            # log to W&B every epoch
-            wandb.log(
-                {
-                    "train/loss": train_loss,
-                    "train/lr": lr,
-                    "epoch": epoch,
-                },
-                step=epoch,
-            )
+            log_dict = {
+                "train/loss": train_loss,
+                "train/lr": lr,
+                "time/train_epoch": train_time,
+                "epoch": epoch,
+            }
 
-            # validate every N epochs
+            # validate
             if (epoch + 1) % validate_every == 0 or epoch == 0:
+                t0 = time.time()
                 metrics = self.validate()
+                val_time = time.time() - t0
 
-                wandb.log(
+                log_dict.update(
                     {
                         "val/psnr": metrics["psnr"],
                         "val/ssim": metrics["ssim"],
-                    },
-                    step=epoch,
+                        "time/val_epoch": val_time,
+                        "time/total_epoch": train_time + val_time,
+                    }
                 )
 
-                # log sample images every 10 epochs
                 if (epoch + 1) % 10 == 0:
                     self._log_samples(metrics["samples"], epoch)
 
-                # save best
                 if metrics["psnr"] > self.best_psnr:
                     self.best_psnr = metrics["psnr"]
                     self.save_checkpoint(epoch, metrics, tag="best")
                     print(
                         f"epoch {epoch:4d} | loss {train_loss:.4f} | "
                         f"PSNR {metrics['psnr']:.2f}dB ← best | "
-                        f"SSIM {metrics['ssim']:.4f} | LR {lr:.2e}"
+                        f"SSIM {metrics['ssim']:.4f} | "
+                        f"train {train_time:.0f}s | val {val_time:.0f}s"
                     )
                 else:
                     print(
                         f"epoch {epoch:4d} | loss {train_loss:.4f} | "
                         f"PSNR {metrics['psnr']:.2f}dB | "
-                        f"SSIM {metrics['ssim']:.4f} | LR {lr:.2e}"
+                        f"SSIM {metrics['ssim']:.4f} | "
+                        f"train {train_time:.0f}s | val {val_time:.0f}s"
                     )
 
-                # always save latest
                 self.save_checkpoint(epoch, metrics, tag="latest")
 
             else:
-                print(f"epoch {epoch:4d} | loss {train_loss:.4f} | LR {lr:.2e}")
+                log_dict["time/total_epoch"] = train_time
+                print(
+                    f"epoch {epoch:4d} | loss {train_loss:.4f} | "
+                    f"train {train_time:.0f}s | LR {lr:.2e}"
+                )
+
+            wandb.log(log_dict, step=epoch)
 
         print("-" * 50)
         print(f"training complete. best PSNR: {self.best_psnr:.2f}dB")

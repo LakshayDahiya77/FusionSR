@@ -117,7 +117,10 @@ def main():
     )
 
     # ── resume if specified ──
-    if CONFIG["resume"]:
+    if CONFIG["resume"] == "wandb":
+        ckpt_path = download_checkpoint(CONFIG["wandb_project"])
+        trainer.load_checkpoint(ckpt_path)
+    elif CONFIG["resume"]:
         trainer.load_checkpoint(CONFIG["resume"])
 
     # ── train ──
