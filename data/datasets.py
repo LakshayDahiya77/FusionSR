@@ -170,19 +170,17 @@ class DIV2KDataset(Dataset):
 # ─────────────────────────────────────────
 #  Dataloaders
 # ─────────────────────────────────────────
-def make_dataloaders_fast(
+
+
+def make_train_dataloader(
     train_hr: str,
     train_lr: str,
-    valid_hr: str,
-    valid_lr: str,
     patch_lr: int = 64,
     batch_size: int = 32,
     num_workers: int = 4,
 ):
     train_ds = DIV2KDatasetFast(train_hr, train_lr, patch_lr=patch_lr, training=True)
-    valid_ds = DIV2KDatasetFast(valid_hr, valid_lr, patch_lr=patch_lr, training=False)
-
-    train_dl = DataLoader(
+    return DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
@@ -191,47 +189,6 @@ def make_dataloaders_fast(
         drop_last=True,
         persistent_workers=True,
     )
-    valid_dl = DataLoader(
-        valid_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        persistent_workers=True,
-    )
-
-    return train_dl, valid_dl
-
-
-def make_dataloaders(
-    train_hr: str,
-    train_lr: str,
-    valid_hr: str,
-    valid_lr: str,
-    patch_lr: int = 64,
-    batch_size: int = 16,
-    num_workers: int = 4,
-):
-    train_ds = DIV2KDataset(train_hr, train_lr, patch_lr=patch_lr, training=True)
-    valid_ds = DIV2KDataset(valid_hr, valid_lr, patch_lr=patch_lr, training=False)
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    valid_dl = DataLoader(
-        valid_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-    )
-
-    return train_dl, valid_dl
 
 
 class BenchmarkDataset(Dataset):

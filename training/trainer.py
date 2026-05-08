@@ -146,6 +146,7 @@ class Trainer:
         artifact.add_file(path)
         wandb.log_artifact(artifact)
 
+    @staticmethod
     def download_checkpoint(run_path: str, tag: str = "latest") -> str:
         """
         Download checkpoint from W&B.
@@ -231,7 +232,7 @@ class Trainer:
                     }
                 )
 
-                if (epoch + 1) % 10 == 0:
+                if (epoch + 1) % 10 == 0 and "samples" in metrics:
                     self._log_samples(metrics["samples"], epoch)
 
                 if metrics["psnr"] > self.best_psnr:

@@ -276,8 +276,12 @@ class SwinBlockPair(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
 
-        # compute mask once, reuse if spatial dims unchanged
-        if self._attn_mask is None or self._attn_mask.device != x.device:
+        if (
+            self._attn_mask is None
+            or self._attn_mask.device != x.device
+            or self._attn_mask.shape[0]
+            != (H // self.window_size) * (W // self.window_size)
+        ):
             self._attn_mask = self._compute_mask(H, W, x.device)
 
         x = self.w_msa(x, attn_mask=None)

@@ -6,7 +6,7 @@ from kaggle_secrets import UserSecretsClient
 
 from models.fusionsr import FusionSR
 from models.losses import CharbonnierLoss
-from data.datasets import make_dataloaders_fast, make_benchmark_loader, setup_ramdisk
+from data.datasets import make_train_dataloader, make_benchmark_loader, setup_ramdisk
 from training.trainer import Trainer
 
 # ─────────────────────────────────────────
@@ -69,17 +69,13 @@ def main():
         {
             "train_hr": f"{base}/DIV2K_train_HR",
             "train_lr": f"{base}/DIV2K_train_LR_bicubic_X4/X4",
-            "valid_hr": f"{base}/DIV2K_valid_HR",
-            "valid_lr": f"{base}/DIV2K_valid_LR_bicubic_X4/X4",
         }
     )
 
     # ── dataloaders ──
-    train_dl, _ = make_dataloaders_fast(
+    train_dl = make_train_dataloader(
         train_hr=dst["train_hr"],
         train_lr=dst["train_lr"],
-        valid_hr=dst["train_hr"],  # dummy, not used
-        valid_lr=dst["train_lr"],  # dummy, not used
         patch_lr=CONFIG["patch_lr"],
         batch_size=CONFIG["batch_size"],
         num_workers=CONFIG["num_workers"],
@@ -128,7 +124,7 @@ def main():
 
     # ── resume if specified ──
     if CONFIG["resume"] == "wandb":
-        ckpt_path = download_checkpoint(CONFIG["wandb_project"])
+        ckpt_path = Trainer.download_checkpoint(CONFIG["wandb_project"])
         trainer.load_checkpoint(ckpt_path)
     elif CONFIG["resume"]:
         trainer.load_checkpoint(CONFIG["resume"])
