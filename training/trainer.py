@@ -85,37 +85,33 @@ class Trainer:
         total_ssim = 0.0
         samples = []
 
+        patch_lr = self.config["patch_lr"]
+        patch_hr = patch_lr * self.config["scale"]
+
         for i, (lr_imgs, hr_imgs) in enumerate(self.valid_dl):
             lr_imgs = lr_imgs.to(self.device)
             hr_imgs = hr_imgs.to(self.device)
 
-            # pad LR so H and W are divisible by window_size
+            # center crop
             _, _, h, w = lr_imgs.shape
-            window_size = 8
-            pad_h = (window_size - h % window_size) % window_size
-            pad_w = (window_size - w % window_size) % window_size
-            if pad_h > 0 or pad_w > 0:
-                lr_imgs = torch.nn.functional.pad(
-                    lr_imgs, (0, pad_w, 0, pad_h), mode="reflect"
-                )
+            y = (h - patch_lr) // 2
+            x = (w - patch_lr) // 2
+            lr_crop = lr_imgs[:, :, y : y + patch_lr, x : x + patch_lr]
+            hr_crop = hr_imgs[:, :, y * 4 : y * 4 + patch_hr, x * 4 : x * 4 + patch_hr]
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred = self.model(lr_imgs).float().clamp(0, 1)
+                pred = self.model(lr_crop).float().clamp(0, 1)
 
-            # crop prediction back to original HR size
-            hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
-            pred = pred[:, :, :hr_h, :hr_w]
-
-            hr_imgs = hr_imgs.float()
-            total_psnr += psnr(pred, hr_imgs)
-            total_ssim += ssim(pred, hr_imgs)
+            hr_crop = hr_crop.float()
+            total_psnr += psnr(pred, hr_crop)
+            total_ssim += ssim(pred, hr_crop)
 
             if i < num_samples:
                 samples.append(
                     {
-                        "lr": lr_imgs[:, :, :h, :w][0].cpu(),
+                        "lr": lr_crop[0].cpu(),
                         "sr": pred[0].cpu(),
-                        "hr": hr_imgs[0].cpu(),
+                        "hr": hr_crop[0].cpu(),
                     }
                 )
 
