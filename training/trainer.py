@@ -134,12 +134,19 @@ class Trainer:
     # ── checkpoint ────────────────────────
     def save_checkpoint(self, epoch: int, metrics: dict, tag: str = "latest"):
         path = os.path.join(self.save_dir, f"fusionsr_{tag}.pt")
+
+        # UNWRAP: If using DataParallel, save the inner module's weights
+        model_state = (
+            self.model.module.state_dict()
+            if isinstance(self.model, nn.DataParallel)
+            else self.model.state_dict()
+        )
+
         torch.save(
             {
                 "epoch": epoch,
-                "model": self.model.state_dict(),
+                "model": model_state,
                 "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),  # ← added
                 "scaler": self.scaler.state_dict(),
                 "best_psnr": self.best_psnr,
                 "config": self.config,
@@ -148,6 +155,7 @@ class Trainer:
             path,
         )
 
+        # upload to W&B as artifact
         artifact = wandb.Artifact(
             name=f"fusionsr-{tag}", type="model", metadata={"epoch": epoch, **metrics}
         )
@@ -166,11 +174,15 @@ class Trainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model"])
+
+        # UNWRAP: If the current model is DataParallel, load weights into the inner module
+        if isinstance(self.model, nn.DataParallel):
+            self.model.module.load_state_dict(ckpt["model"])
+        else:
+            self.model.load_state_dict(ckpt["model"])
+
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scaler.load_state_dict(ckpt["scaler"])
-        if "scheduler" in ckpt:
-            self.scheduler.load_state_dict(ckpt["scheduler"])
         self.best_psnr = ckpt["best_psnr"]
         self.start_epoch = ckpt["epoch"] + 1
         print(f"resumed from epoch {ckpt['epoch']} | best PSNR {self.best_psnr:.2f}dB")

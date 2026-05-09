@@ -82,27 +82,29 @@ def main():
 
     print(f"W&B run ID: {run.id}")
 
-    # ── RAM disk ──
+    # ── RAM disk (Flickr2K ONLY - Stress Test) ──
     div2k_base = CONFIG["div2k_base"]
     flickr_base = CONFIG["flickr_base"]
+
+    # Attempting to load the ~11.8GB dataset into the 15.2GB RAM pool
     dst = setup_ramdisk(
         {
-            "train_hr": f"{div2k_base}/DIV2K_train_HR",
-            "train_lr": f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
             "flickr_hr": f"{flickr_base}/Flickr2K_HR",
             "flickr_lr": f"{flickr_base}/Flickr2K_LR_bicubic/X4",
         }
     )
+
     # ── dataloaders ──
     train_dl = make_combined_dataloader(
-        div2k_hr=dst["train_hr"],
-        div2k_lr=dst["train_lr"],
-        flickr_hr=dst["flickr_hr"],
+        div2k_hr=f"{div2k_base}/DIV2K_train_HR",  # NVMe SSD
+        div2k_lr=f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
+        flickr_hr=dst["flickr_hr"],  # RAM Disk
         flickr_lr=dst["flickr_lr"],
         patch_lr=CONFIG["patch_lr"],
         batch_size=CONFIG["batch_size"],
         num_workers=CONFIG["num_workers"],
     )
+
     # validation dataloader — Set5
     bench_base = CONFIG["bench_base"]
     valid_dl = make_benchmark_loader(
@@ -122,7 +124,14 @@ def main():
         window_size=CONFIG["window_size"],
         num_heads=CONFIG["num_heads"],
         scale=CONFIG["scale"],
-    ).to(device)
+    )
+
+    # Distribute the batch across both T4 GPUs automatically
+    if torch.cuda.device_count() > 1:
+        print(f"Parallelizing across {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)
+
+    model = model.to(device)
 
     from models.fusionsr import count_parameters
 
