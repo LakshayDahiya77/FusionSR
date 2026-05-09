@@ -145,7 +145,12 @@ class Trainer:
                 .clamp(0, 1)
             )
 
-            comparison = torch.cat([lr_up, s["sr"], s["hr"]], dim=2)
+            # ensure all three have matching spatial size before concat
+            h, w = s["hr"].shape[-2], s["hr"].shape[-1]
+            lr_up = lr_up[:, :h, :w]
+            sr = s["sr"][:, :h, :w]
+
+            comparison = torch.cat([lr_up, sr, s["hr"]], dim=2)
             img = comparison.permute(1, 2, 0).numpy()
             panels.append(wandb.Image(img, caption="bicubic | SR | HR"))
 
