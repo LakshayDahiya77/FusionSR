@@ -2,10 +2,10 @@ import os
 import shutil
 import random
 from pathlib import Path
-from torch.utils.data import ConcatDataset
+
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import numpy as np
 from PIL import Image
 
@@ -13,7 +13,7 @@ from PIL import Image
 # ─────────────────────────────────────────
 #  RAM Disk Setup
 # ─────────────────────────────────────────
-def setup_ramdisk(src_dirs: dict, ramdisk: str = "/dev/shm/div2k") -> dict:
+def setup_ramdisk(src_dirs: dict, ramdisk: str = "/dev/shm/fusionsr") -> dict:
     os.makedirs(ramdisk, exist_ok=True)
     dst_dirs = {}
     for name, src in src_dirs.items():
@@ -22,7 +22,7 @@ def setup_ramdisk(src_dirs: dict, ramdisk: str = "/dev/shm/div2k") -> dict:
             print(f"{name}: already in RAM disk")
             dst_dirs[name] = dst
             continue
-        print(f"copying {name}...", end=" ")
+        print(f"copying {name}...", end=" ", flush=True)
         shutil.copytree(src, dst)
         print(f"done ({len(os.listdir(dst))} files)")
         dst_dirs[name] = dst
@@ -37,20 +37,17 @@ def setup_ramdisk(src_dirs: dict, ramdisk: str = "/dev/shm/div2k") -> dict:
 def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
     """
     Random flip and rotation on GPU tensors.
-    lr: [B, 3, H, W]
-    hr: [B, 3, H*4, W*4]
+    lr: [B, C, H, W]
+    hr: [B, C, H*scale, W*scale]
     """
-    # random horizontal flip
     if random.random() > 0.5:
         lr = torch.flip(lr, dims=[-1])
         hr = torch.flip(hr, dims=[-1])
 
-    # random vertical flip
     if random.random() > 0.5:
         lr = torch.flip(lr, dims=[-2])
         hr = torch.flip(hr, dims=[-2])
 
-    # random 90-degree rotation (0, 90, 180, 270)
     k = random.randint(0, 3)
     if k > 0:
         lr = torch.rot90(lr, k, dims=[-2, -1])
@@ -60,23 +57,25 @@ def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
 
 
 # ─────────────────────────────────────────
-#  Fast Dataset — pre-loads all images into RAM
+#  Fast Dataset — pre-loads LR into RAM, HR lazily
 # ─────────────────────────────────────────
 class DIV2KDatasetFast(Dataset):
     """
-    Pre-loads all LR images into RAM (small, safe).
-    HR images loaded lazily from RAM disk (fast enough — already in /dev/shm).
-
+    Pre-loads all LR images into RAM.
+    HR images loaded lazily from hr_dir (RAM disk or SSD).
+    Works for both DIV2K and Flickr2K — same filename convention.
+    HR: 000001.png  LR: 000001x4.png
     """
 
-    def __init__(self, hr_dir, lr_dir, patch_lr=64, training=True):
+    def __init__(
+        self, hr_dir: str, lr_dir: str, patch_lr: int = 64, training: bool = True
+    ):
         super().__init__()
         self.patch_lr = patch_lr
         self.training = training
-        self.hr_dir = Path(hr_dir)
 
         hr_files = sorted(Path(hr_dir).glob("*.png"))
-        assert len(hr_files) > 0
+        assert len(hr_files) > 0, f"No PNG files in {hr_dir}"
 
         print(f"pre-loading {len(hr_files)} LR images...", end=" ", flush=True)
         self.lr_images = []
@@ -84,20 +83,17 @@ class DIV2KDatasetFast(Dataset):
 
         for hr_path in hr_files:
             lr_path = Path(lr_dir) / f"{hr_path.stem}x4.png"
-            # pre-load LR only — small images, safe
             lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
             self.lr_images.append(lr)
-            self.hr_paths.append(hr_path)  # HR loaded lazily
+            self.hr_paths.append(hr_path)
 
-        print(f"done.")
+        print("done.")
 
     def __len__(self):
         return len(self.lr_images)
 
     def __getitem__(self, idx):
         lr = torch.from_numpy(self.lr_images[idx]).permute(2, 0, 1)
-
-        # load HR from RAM disk lazily — fast since /dev/shm is in memory
         hr = (
             np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.float32)
             / 255.0
@@ -109,7 +105,7 @@ class DIV2KDatasetFast(Dataset):
 
         return lr, hr
 
-    def _random_crop(self, lr, hr):
+    def _random_crop(self, lr: torch.Tensor, hr: torch.Tensor):
         _, h, w = lr.shape
         p = self.patch_lr
 
@@ -127,49 +123,126 @@ class DIV2KDatasetFast(Dataset):
 
 
 # ─────────────────────────────────────────
-#  Original Dataset (PIL-based, kept for reference)
+#  Satellite Dataset — for PROBA-V / WorldStrat
 # ─────────────────────────────────────────
-class DIV2KDataset(Dataset):
-    def __init__(self, hr_dir, lr_dir, patch_lr=64, training=True):
+class SatelliteDataset(Dataset):
+    """
+    Dataset for satellite image SR fine-tuning.
+    Expects paired LR/HR satellite images.
+    HR and LR in separate directories, matched by filename.
+
+    PROBA-V structure:
+        hr_dir/: 0001.png, 0002.png ...  (100m resolution)
+        lr_dir/: 0001.png, 0002.png ...  (300m resolution, 3x downscaled)
+
+    Set training=False for validation (returns full images).
+    """
+
+    def __init__(
+        self,
+        hr_dir: str,
+        lr_dir: str,
+        patch_lr: int = 64,
+        training: bool = True,
+    ):
         super().__init__()
-        self.hr_dir = Path(hr_dir)
-        self.lr_dir = Path(lr_dir)
         self.patch_lr = patch_lr
         self.training = training
-        self.hr_files = sorted(self.hr_dir.glob("*.png"))
-        assert len(self.hr_files) > 0
+
+        self.hr_files = sorted(Path(hr_dir).glob("*.png"))
+        self.lr_dir = Path(lr_dir)
+        assert len(self.hr_files) > 0, f"No PNG files in {hr_dir}"
+
+        print(f"satellite dataset: {len(self.hr_files)} image pairs from {hr_dir}")
 
     def __len__(self):
         return len(self.hr_files)
 
     def __getitem__(self, idx):
         hr_path = self.hr_files[idx]
-        lr_path = self.lr_dir / f"{hr_path.stem}x4.png"
+        lr_path = self.lr_dir / hr_path.name  # same filename in LR dir
+
         hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
         lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
+
         hr = torch.from_numpy(hr).permute(2, 0, 1)
         lr = torch.from_numpy(lr).permute(2, 0, 1)
+
         if self.training:
             lr, hr = self._random_crop(lr, hr)
+
         return lr, hr
 
-    def _random_crop(self, lr, hr):
+    def _random_crop(self, lr: torch.Tensor, hr: torch.Tensor):
         _, h, w = lr.shape
         p = self.patch_lr
+
         if h < p or w < p:
             lr = F.pad(lr, (0, max(0, p - w), 0, max(0, p - h)))
             hr = F.pad(hr, (0, max(0, p - w) * 4, 0, max(0, p - h) * 4))
             _, h, w = lr.shape
-        x = random.randint(0, w - p)
-        y = random.randint(0, h - p)
+
+        x = torch.randint(0, w - p + 1, (1,)).item()
+        y = torch.randint(0, h - p + 1, (1,)).item()
+
         lr = lr[:, y : y + p, x : x + p]
         hr = hr[:, y * 4 : y * 4 + p * 4, x * 4 : x * 4 + p * 4]
         return lr, hr
 
 
 # ─────────────────────────────────────────
-#  Dataloaders
+#  Benchmark Dataset — Set5, Set14
 # ─────────────────────────────────────────
+class BenchmarkDataset(Dataset):
+    """
+    Standard SR benchmark datasets (Set5, Set14).
+    HR: GTmod12 folder, LR: LRbicx4 folder.
+    Returns (lr, hr, filename) for per-image logging.
+    """
+
+    def __init__(self, hr_dir: str, lr_dir: str):
+        super().__init__()
+        self.hr_files = sorted(Path(hr_dir).glob("*.png"))
+        self.lr_dir = Path(lr_dir)
+        assert len(self.hr_files) > 0, f"No PNG files in {hr_dir}"
+
+    def __len__(self):
+        return len(self.hr_files)
+
+    def __getitem__(self, idx):
+        hr_path = self.hr_files[idx]
+        lr_path = self.lr_dir / hr_path.name
+
+        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
+        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
+
+        hr = torch.from_numpy(hr).permute(2, 0, 1)
+        lr = torch.from_numpy(lr).permute(2, 0, 1)
+
+        return lr, hr, hr_path.name
+
+
+# ─────────────────────────────────────────
+#  Dataloader factories
+# ─────────────────────────────────────────
+def make_train_dataloader(
+    train_hr: str,
+    train_lr: str,
+    patch_lr: int = 64,
+    batch_size: int = 32,
+    num_workers: int = 4,
+) -> DataLoader:
+    """DIV2K only training dataloader."""
+    ds = DIV2KDatasetFast(train_hr, train_lr, patch_lr=patch_lr, training=True)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,
+    )
 
 
 def make_combined_dataloader(
@@ -180,15 +253,15 @@ def make_combined_dataloader(
     patch_lr: int = 64,
     batch_size: int = 32,
     num_workers: int = 4,
-):
+) -> DataLoader:
     """
     Combined DIV2K + Flickr2K training dataloader.
     DIV2K: 800 images, Flickr2K: 2650 images → 3450 total.
     """
     div2k_ds = DIV2KDatasetFast(div2k_hr, div2k_lr, patch_lr=patch_lr, training=True)
     flickr_ds = DIV2KDatasetFast(flickr_hr, flickr_lr, patch_lr=patch_lr, training=True)
-
     combined = ConcatDataset([div2k_ds, flickr_ds])
+
     print(
         f"combined dataset: {len(combined)} images "
         f"({len(div2k_ds)} DIV2K + {len(flickr_ds)} Flickr2K)"
@@ -205,19 +278,17 @@ def make_combined_dataloader(
     )
 
 
-setup_ramdisk
-
-
-def make_train_dataloader(
+def make_satellite_dataloader(
     train_hr: str,
     train_lr: str,
     patch_lr: int = 64,
-    batch_size: int = 32,
+    batch_size: int = 16,
     num_workers: int = 4,
-):
-    train_ds = DIV2KDatasetFast(train_hr, train_lr, patch_lr=patch_lr, training=True)
+) -> DataLoader:
+    """Satellite image training dataloader (PROBA-V / WorldStrat)."""
+    ds = SatelliteDataset(train_hr, train_lr, patch_lr=patch_lr, training=True)
     return DataLoader(
-        train_ds,
+        ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
@@ -227,36 +298,13 @@ def make_train_dataloader(
     )
 
 
-class BenchmarkDataset(Dataset):
-    """
-    Dataset for standard SR benchmarks (Set5, Set14).
-    Uses pre-paired LR/HR images from the benchmark dataset.
-    HR: GTmod12 folder
-    LR: LRbicx4 folder
-    """
-
-    def __init__(self, hr_dir: str, lr_dir: str):
-        super().__init__()
-        self.hr_files = sorted(Path(hr_dir).glob("*.png"))
-        self.lr_dir = Path(lr_dir)
-        assert len(self.hr_files) > 0, f"No PNG files in {hr_dir}"
-
-    def __len__(self):
-        return len(self.hr_files)
-
-    def __getitem__(self, idx):
-        hr_path = self.hr_files[idx]
-        lr_path = self.lr_dir / hr_path.name  # same filename in LR folder
-
-        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
-        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
-
-        hr = torch.from_numpy(hr).permute(2, 0, 1)
-        lr = torch.from_numpy(lr).permute(2, 0, 1)
-
-        return lr, hr, hr_path.name  # return filename for logging
-
-
-def make_benchmark_loader(hr_dir: str, lr_dir: str):
+def make_benchmark_loader(hr_dir: str, lr_dir: str) -> DataLoader:
+    """Set5 / Set14 benchmark dataloader."""
     ds = BenchmarkDataset(hr_dir, lr_dir)
+    return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
+
+
+def make_satellite_val_loader(hr_dir: str, lr_dir: str) -> DataLoader:
+    """Satellite validation dataloader — full images, no cropping."""
+    ds = SatelliteDataset(hr_dir, lr_dir, training=False)
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
