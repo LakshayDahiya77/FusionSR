@@ -328,30 +328,27 @@ class SatelliteHRDataset(Dataset):
         self.patch_hr = patch_hr
         self.training = training
 
-        hr_files = sorted(
+        self.hr_files = sorted(
             [p for p in Path(hr_dir).rglob("*") if p.suffix.lower() in extensions]
         )
-        assert len(hr_files) > 0, f"No images found in {hr_dir}"
-
-        print(
-            f"pre-loading {len(hr_files)} satellite HR images...", end=" ", flush=True
-        )
-        self.hr_images = []
-        for p in hr_files:
-            hr = np.array(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
-            self.hr_images.append(hr)
-        print("done.")
+        assert len(self.hr_files) > 0, f"No images found in {hr_dir}"
+        print(f"SatelliteHRDataset: {len(self.hr_files)} images indexed from {hr_dir}")
 
     def __len__(self):
-        return len(self.hr_images)
+        return len(self.hr_files)
 
     def __getitem__(self, idx):
-        hr = torch.from_numpy(self.hr_images[idx]).permute(2, 0, 1)
+        # load from RAM disk on-the-fly — fast since /dev/shm is in memory
+        hr = (
+            np.array(Image.open(self.hr_files[idx]).convert("RGB"), dtype=np.float32)
+            / 255.0
+        )
+        hr = torch.from_numpy(hr).permute(2, 0, 1)
 
         if self.training:
             hr = self._random_crop(hr)
 
-        return hr  # LR generated on GPU in training loop
+        return hr
 
     def _random_crop(self, hr: torch.Tensor) -> torch.Tensor:
         _, h, w = hr.shape
