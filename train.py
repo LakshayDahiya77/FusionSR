@@ -8,8 +8,7 @@ from models.losses import CharbonnierLoss
 from data.datasets import (
     make_train_dataloader,
     make_combined_dataloader,
-    make_satellite_dataloader,
-    make_satellite_val_loader,
+    make_satellite_hr_dataloader,
     make_benchmark_loader,
     setup_ramdisk,
 )
@@ -29,22 +28,18 @@ CONFIG = {
     "scale": 4,
     # ── training mode ──
     # "general_sr"  → pretrain on DIV2K / DIV2K+Flickr2K
-    # "satellite"   → fine-tune on satellite dataset
+    # "satellite"   → fine-tune on satellite dataset (DIOR)
     "mode": "general_sr",
     # ── general SR data ──
     "div2k_base": "/kaggle/input/datasets/takihasan/div2k-dataset-for-super-resolution/Dataset",
     "flickr_base": "/kaggle/input/datasets/hliang001/flickr2k/Flickr2K",
-    # use_flickr: True = DIV2K + Flickr2K, False = DIV2K only
-    "use_flickr": True,
-    # ── satellite data (used when mode="satellite") ──
-    # update these paths when PROBA-V / WorldStrat is added to Kaggle
-    "sat_train_hr": "/kaggle/input/proba-v/train/HR",  # placeholder
-    "sat_train_lr": "/kaggle/input/proba-v/train/LR",  # placeholder
-    "sat_valid_hr": "/kaggle/input/proba-v/val/HR",  # placeholder
-    "sat_valid_lr": "/kaggle/input/proba-v/val/LR",  # placeholder
-    # ── benchmarks (Set5, Set14) ──
+    "use_flickr": True,  # True = DIV2K + Flickr2K, False = DIV2K only
+    # ── satellite data (DIOR) ──
+    "dior_base": "/kaggle/input/datasets/redzapdos123/dior-r-dataset-yolov11-obb-format/YOLODIOR-R",
+    "patch_hr": 256,  # HR patch size for satellite (LR = 256//4 = 64)
+    # ── benchmarks ──
     "bench_base": "/kaggle/input/datasets/jesucristo/super-resolution-benchmarks",
-    # ── training hyperparams ──
+    # ── general SR training hyperparams ──
     "epochs": 50,
     "lr_max": 2e-4,
     "lr_min": 1e-6,
@@ -53,18 +48,18 @@ CONFIG = {
     "patch_lr": 64,
     "num_workers": 4,
     "validate_every": 1,
-    # ── satellite fine-tune hyperparams (lower LR to preserve pretrained weights) ──
-    # override lr_max and lr_min when mode="satellite"
-    "sat_lr_max": 5e-5,
+    # ── satellite fine-tune hyperparams ──
+    "sat_lr_max": 5e-5,  # lower LR — preserve pretrained weights
     "sat_lr_min": 1e-7,
-    "sat_batch": 16,  # smaller batch — satellite images are larger
+    "sat_sgdr_t0": 50,
+    "sat_batch": 16,
     # ── wandb ──
     "wandb_project": "FusionSR",
     "wandb_run": "phase1-div2k-flickr",  # name for fresh runs
-    "wandb_run_id": None,  # set to resume existing run (e.g. "gvolrfd3")
+    "wandb_run_id": None,  # set to resume existing run e.g. "gvolrfd3"
     # ── resume ──
     "resume": None,  # None | "wandb" | "/path/to/checkpoint.pt"
-    "reset_best_psnr": False,  # set True when switching from general SR → satellite
+    "reset_best_psnr": False,  # set True when switching general SR → satellite
     # ── paths ──
     "save_dir": "/kaggle/working/checkpoints",
 }
@@ -100,12 +95,12 @@ def main():
 
     # ── dataloaders ──
     if CONFIG["mode"] == "general_sr":
-        # ── general SR mode ──
+
         div2k_base = CONFIG["div2k_base"]
         flickr_base = CONFIG["flickr_base"]
 
         if CONFIG["use_flickr"]:
-            # DIV2K from SSD (too large for RAM), Flickr2K in RAM disk
+            # Flickr2K in RAM disk, DIV2K from SSD
             dst = setup_ramdisk(
                 {
                     "flickr_hr": f"{flickr_base}/Flickr2K_HR",
@@ -148,33 +143,30 @@ def main():
         lr_min = CONFIG["lr_min"]
 
     elif CONFIG["mode"] == "satellite":
-        # ── satellite fine-tune mode ──
-        # copy satellite data to RAM disk if it fits
-        dst = setup_ramdisk(
-            {
-                "sat_train_hr": CONFIG["sat_train_hr"],
-                "sat_train_lr": CONFIG["sat_train_lr"],
-                "sat_valid_hr": CONFIG["sat_valid_hr"],
-                "sat_valid_lr": CONFIG["sat_valid_lr"],
-            }
-        )
 
-        train_dl = make_satellite_dataloader(
-            train_hr=dst["sat_train_hr"],
-            train_lr=dst["sat_train_lr"],
-            patch_lr=CONFIG["patch_lr"],
+        dior_base = CONFIG["dior_base"]
+
+        train_dl = make_satellite_hr_dataloader(
+            hr_dir=f"{dior_base}/train/images",
+            patch_hr=CONFIG["patch_hr"],
+            scale=CONFIG["scale"],
             batch_size=CONFIG["sat_batch"],
             num_workers=CONFIG["num_workers"],
+            training=True,
         )
 
-        valid_dl = make_satellite_val_loader(
-            hr_dir=dst["sat_valid_hr"],
-            lr_dir=dst["sat_valid_lr"],
+        valid_dl = make_satellite_hr_dataloader(
+            hr_dir=f"{dior_base}/val/images",
+            patch_hr=CONFIG["patch_hr"],
+            scale=CONFIG["scale"],
+            batch_size=1,
+            num_workers=2,
+            training=False,
         )
 
-        # lower LR for fine-tuning — preserve pretrained weights
         lr_max = CONFIG["sat_lr_max"]
         lr_min = CONFIG["sat_lr_min"]
+        CONFIG["sgdr_t0"] = CONFIG["sat_sgdr_t0"]
 
     else:
         raise ValueError(f"unknown mode: {CONFIG['mode']}")
@@ -193,7 +185,6 @@ def main():
         scale=CONFIG["scale"],
     )
 
-    # multi-GPU if available
     if torch.cuda.device_count() > 1:
         print(f"using {torch.cuda.device_count()} GPUs via DataParallel")
         model = torch.nn.DataParallel(model)
@@ -234,23 +225,40 @@ def main():
         validate_every=CONFIG["validate_every"],
     )
 
-    # ── post-training benchmark eval (runs after every session) ──
-    print("\nrunning benchmark evaluation...")
-    bench_base = CONFIG["bench_base"]
-    for name, hr_sub, lr_sub in [
-        ("Set5", "Set5/Set5/GTmod12", "Set5/Set5/LRbicx4"),
-        ("Set14", "Set14/Set14/GTmod12", "Set14/Set14/LRbicx4"),
-    ]:
-        dl = make_benchmark_loader(
-            hr_dir=f"{bench_base}/{hr_sub}",
-            lr_dir=f"{bench_base}/{lr_sub}",
+    # ── post-training benchmark eval ──
+    if CONFIG["mode"] == "general_sr":
+        print("\nrunning benchmark evaluation...")
+        bench_base = CONFIG["bench_base"]
+        for name, hr_sub, lr_sub in [
+            ("Set5", "Set5/Set5/GTmod12", "Set5/Set5/LRbicx4"),
+            ("Set14", "Set14/Set14/GTmod12", "Set14/Set14/LRbicx4"),
+        ]:
+            dl = make_benchmark_loader(
+                hr_dir=f"{bench_base}/{hr_sub}",
+                lr_dir=f"{bench_base}/{lr_sub}",
+            )
+            m = trainer.validate_benchmark(dl, name)
+            print(f"{name:6s} — PSNR: {m['psnr']:.2f}dB | SSIM: {m['ssim']:.4f}")
+            wandb.log(
+                {
+                    f"benchmark/{name}/psnr": m["psnr"],
+                    f"benchmark/{name}/ssim": m["ssim"],
+                }
+            )
+
+    elif CONFIG["mode"] == "satellite":
+        print("\nrunning final satellite validation...")
+        m = trainer.validate_satellite(valid_dl, "DIOR-val")
+        print(
+            f"DIOR val — RGB PSNR: {m['psnr_rgb']:.2f}dB | "
+            f"Y PSNR: {m['psnr_y']:.2f}dB | "
+            f"SSIM Y: {m['ssim_y']:.4f}"
         )
-        m = trainer.validate_benchmark(dl, name)
-        print(f"{name:6s} — PSNR: {m['psnr']:.2f}dB | SSIM: {m['ssim']:.4f}")
         wandb.log(
             {
-                f"benchmark/{name}/psnr": m["psnr"],
-                f"benchmark/{name}/ssim": m["ssim"],
+                "final/psnr_rgb": m["psnr_rgb"],
+                "final/psnr_y": m["psnr_y"],
+                "final/ssim_y": m["ssim_y"],
             }
         )
 

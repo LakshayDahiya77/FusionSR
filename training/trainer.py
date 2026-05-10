@@ -217,6 +217,70 @@ class Trainer:
             "samples": samples,
         }
 
+    @torch.no_grad()
+    def validate_satellite(self, sat_val_dl, name: str = "DIOR") -> dict:
+        """
+        Validation for satellite HR-only datasets.
+        Generates LR from HR bicubically, runs model, computes RGB + Y-channel metrics.
+        Reports both RGB PSNR and Y-channel PSNR for fair comparison with SR literature.
+        """
+        from utils.metrics import psnr, ssim, psnr_y, ssim_y
+
+        self.model.eval()
+        total_psnr_rgb = 0.0
+        total_ssim_rgb = 0.0
+        total_psnr_y = 0.0
+        total_ssim_y = 0.0
+        samples = []
+        window_size = self.config["window_size"]
+        scale = self.config["scale"]
+
+        for i, (lr_imgs, hr_imgs) in enumerate(sat_val_dl):
+            lr_imgs = lr_imgs.to(self.device)
+            hr_imgs = hr_imgs.to(self.device).float()
+
+            # pad LR to window size
+            _, _, h, w = lr_imgs.shape
+            pad_h = (window_size - h % window_size) % window_size
+            pad_w = (window_size - w % window_size) % window_size
+            if pad_h > 0 or pad_w > 0:
+                lr_imgs = F.pad(lr_imgs, (0, pad_w, 0, pad_h), mode="reflect")
+
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                pred = self.model(lr_imgs).float().clamp(0, 1)
+
+            # crop to HR size
+            hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
+            pred = pred[:, :, :hr_h, :hr_w]
+
+            # boundary crop
+            b = scale
+            pred = pred[:, :, b:-b, b:-b]
+            hr_crop = hr_imgs[:, :, b:-b, b:-b]
+
+            total_psnr_rgb += psnr(pred, hr_crop)
+            total_ssim_rgb += ssim(pred, hr_crop)
+            total_psnr_y += psnr_y(pred, hr_crop)
+            total_ssim_y += ssim_y(pred, hr_crop)
+
+            if i < 5:
+                samples.append(
+                    {
+                        "lr": lr_imgs[0, :, :h, :w].cpu(),
+                        "sr": pred[0].cpu(),
+                        "hr": hr_crop[0].cpu(),
+                    }
+                )
+
+        n = len(sat_val_dl)
+        return {
+            "psnr_rgb": total_psnr_rgb / n,
+            "ssim_rgb": total_ssim_rgb / n,
+            "psnr_y": total_psnr_y / n,
+            "ssim_y": total_ssim_y / n,
+            "samples": samples,
+        }
+
     # ── main training loop ────────────────
     def fit(self, epochs: int, lr_max: float, lr_min: float, validate_every: int = 1):
         print(f"starting training for {epochs} epochs")
@@ -244,46 +308,51 @@ class Trainer:
 
             if (epoch + 1) % validate_every == 0 or epoch == self.start_epoch:
                 t0 = time.time()
-                metrics = self.validate_benchmark(self.valid_dl, "Set5")
-                val_time = time.time() - t0
 
-                log_dict.update(
-                    {
+                if self.config["mode"] == "satellite":
+                    metrics = self.validate_satellite(self.valid_dl, "DIOR")
+                    # use Y-channel PSNR as primary metric for satellite
+                    primary_psnr = metrics["psnr_y"]
+                    val_log = {
+                        "val/psnr_rgb": metrics["psnr_rgb"],
+                        "val/ssim_rgb": metrics["ssim_rgb"],
+                        "val/psnr_y": metrics["psnr_y"],
+                        "val/ssim_y": metrics["ssim_y"],
+                    }
+                else:
+                    metrics = self.validate_benchmark(self.valid_dl, "Set5")
+                    primary_psnr = metrics["psnr"]
+                    val_log = {
                         "val/psnr": metrics["psnr"],
                         "val/ssim": metrics["ssim"],
-                        "time/val_epoch": val_time,
-                        "time/total_epoch": train_time + val_time,
                     }
-                )
 
-                # log sample images every 10 epochs
+                val_time = time.time() - t0
+                val_log["time/val_epoch"] = val_time
+                val_log["time/total_epoch"] = train_time + val_time
+                log_dict.update(val_log)
+
                 if (epoch + 1) % 10 == 0 and "samples" in metrics:
                     self._log_samples(metrics["samples"], epoch)
 
-                # save best
-                if metrics["psnr"] > self.best_psnr:
-                    self.best_psnr = metrics["psnr"]
+                if primary_psnr > self.best_psnr:
+                    self.best_psnr = primary_psnr
                     self.save_checkpoint(epoch, metrics, tag="best")
                     print(
                         f"epoch {epoch:4d} | loss {train_loss:.4f} | "
-                        f"PSNR {metrics['psnr']:.2f}dB ← best | "
-                        f"SSIM {metrics['ssim']:.4f} | "
+                        f"PSNR {primary_psnr:.2f}dB ← best | "
                         f"train {train_time:.0f}s | val {val_time:.0f}s | "
                         f"LR {current_lr:.2e}"
                     )
                 else:
                     print(
                         f"epoch {epoch:4d} | loss {train_loss:.4f} | "
-                        f"PSNR {metrics['psnr']:.2f}dB | "
-                        f"SSIM {metrics['ssim']:.4f} | "
+                        f"PSNR {primary_psnr:.2f}dB | "
                         f"train {train_time:.0f}s | val {val_time:.0f}s | "
                         f"LR {current_lr:.2e}"
                     )
 
-                # always save latest (for resuming)
                 self.save_checkpoint(epoch, metrics, tag="latest")
-
-                # save per-epoch checkpoint (full history, retrievable anytime)
                 self.save_checkpoint(epoch, metrics, tag=f"epoch_{epoch:04d}")
 
             else:
