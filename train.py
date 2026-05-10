@@ -62,6 +62,7 @@ CONFIG = {
     "reset_best_psnr": False,  # set True when switching general SR → satellite
     # ── paths ──
     "save_dir": "/kaggle/working/checkpoints",
+    "max_images": None,  # set to small number for smoke test
 }
 
 
@@ -143,9 +144,10 @@ def main():
         lr_min = CONFIG["lr_min"]
 
     elif CONFIG["mode"] == "satellite":
+        from data.datasets import make_dior_dataloader
+
         dior_base = CONFIG["dior_base"]
 
-        # copy to RAM disk first
         dst = setup_ramdisk(
             {
                 "dior_train": f"{dior_base}/train/images",
@@ -153,22 +155,22 @@ def main():
             }
         )
 
-        train_dl = make_satellite_hr_dataloader(
+        train_dl = make_dior_dataloader(
             hr_dir=dst["dior_train"],
             patch_hr=CONFIG["patch_hr"],
-            scale=CONFIG["scale"],
             batch_size=CONFIG["sat_batch"],
             num_workers=CONFIG["num_workers"],
             training=True,
+            max_images=CONFIG.get("max_images"),  # None in full run
         )
 
-        valid_dl = make_satellite_hr_dataloader(
+        valid_dl = make_dior_dataloader(
             hr_dir=dst["dior_val"],
             patch_hr=CONFIG["patch_hr"],
-            scale=CONFIG["scale"],
             batch_size=1,
             num_workers=2,
             training=False,
+            max_images=CONFIG.get("max_images"),
         )
 
         lr_max = CONFIG["sat_lr_max"]

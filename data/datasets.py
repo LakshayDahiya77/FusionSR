@@ -310,11 +310,15 @@ def make_satellite_val_loader(hr_dir: str, lr_dir: str) -> DataLoader:
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
 
 
-class SatelliteHRDataset(Dataset):
+class DIORDataset(Dataset):
     """
-    Dataset for satellite imagery SR fine-tuning.
-    Loads HR images only — LR generated on GPU in training loop.
-    Pre-loads all images into RAM for fast access.
+    Dataset for DIOR satellite imagery SR fine-tuning.
+
+    Pipeline:
+        CPU: index paths → lazy load from RAM disk → random crop 256×256 HR patch
+        GPU: bicubic downscale to 64×64 LR + augmentation (done in trainer)
+
+    Only the small 256×256 crop crosses the PCIe bus, not the full 800×800 image.
     """
 
     def __init__(
@@ -323,6 +327,7 @@ class SatelliteHRDataset(Dataset):
         patch_hr: int = 256,
         training: bool = True,
         extensions: tuple = (".jpg", ".png", ".jpeg"),
+        max_images: int = None,
     ):
         super().__init__()
         self.patch_hr = patch_hr
@@ -332,35 +337,70 @@ class SatelliteHRDataset(Dataset):
             [p for p in Path(hr_dir).rglob("*") if p.suffix.lower() in extensions]
         )
         assert len(self.hr_files) > 0, f"No images found in {hr_dir}"
-        print(f"SatelliteHRDataset: {len(self.hr_files)} images indexed from {hr_dir}")
+
+        if max_images:
+            self.hr_files = self.hr_files[:max_images]
+
+        print(f"DIORDataset: {len(self.hr_files)} images indexed from {hr_dir}")
 
     def __len__(self):
         return len(self.hr_files)
 
     def __getitem__(self, idx):
-        # load from RAM disk on-the-fly — fast since /dev/shm is in memory
+        # load from RAM disk — fast, JPEG decode on CPU worker
         hr = (
             np.array(Image.open(self.hr_files[idx]).convert("RGB"), dtype=np.float32)
             / 255.0
         )
-        hr = torch.from_numpy(hr).permute(2, 0, 1)
+        hr = torch.from_numpy(hr).permute(2, 0, 1)  # [3, 800, 800]
 
         if self.training:
+            # crop on CPU — only 256×256 patch crosses PCIe bus
             hr = self._random_crop(hr)
+        else:
+            # validation — use center crop for deterministic eval
+            hr = self._center_crop(hr)
 
-        return hr
+        return hr  # [3, 256, 256] — LR generated on GPU in trainer
 
     def _random_crop(self, hr: torch.Tensor) -> torch.Tensor:
         _, h, w = hr.shape
         p = self.patch_hr
-
-        if h < p or w < p:
-            hr = F.pad(hr, (0, max(0, p - w), 0, max(0, p - h)))
-            _, h, w = hr.shape
-
         x = torch.randint(0, w - p + 1, (1,)).item()
         y = torch.randint(0, h - p + 1, (1,)).item()
         return hr[:, y : y + p, x : x + p]
+
+    def _center_crop(self, hr: torch.Tensor) -> torch.Tensor:
+        _, h, w = hr.shape
+        p = self.patch_hr
+        y = (h - p) // 2
+        x = (w - p) // 2
+        return hr[:, y : y + p, x : x + p]
+
+
+def make_dior_dataloader(
+    hr_dir: str,
+    patch_hr: int = 256,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    training: bool = True,
+    max_images: int = None,
+) -> DataLoader:
+    ds = DIORDataset(
+        hr_dir=hr_dir,
+        patch_hr=patch_hr,
+        training=training,
+        max_images=max_images,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=training,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=training,
+        persistent_workers=num_workers > 0,
+    )
 
 
 def make_satellite_hr_dataloader(

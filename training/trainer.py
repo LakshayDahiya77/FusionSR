@@ -53,12 +53,10 @@ class Trainer:
 
         for batch in self.train_dl:
             if is_satellite:
-                # batch is HR only — generate LR on GPU
                 hr_imgs = batch.to(self.device, non_blocking=True)
                 from data.datasets import generate_lr_on_gpu, gpu_augment
 
                 lr_imgs = generate_lr_on_gpu(hr_imgs, scale=self.config["scale"])
-                # augment both together
                 lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
             else:
                 lr_imgs, hr_imgs = batch
@@ -77,7 +75,6 @@ class Trainer:
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-
             total_loss += loss.item()
 
         return total_loss / len(self.train_dl)
@@ -229,12 +226,8 @@ class Trainer:
 
     @torch.no_grad()
     def validate_satellite(self, sat_val_dl, name: str = "DIOR") -> dict:
-        """
-        Validation for satellite HR-only datasets.
-        Generates LR from HR bicubically, runs model, computes RGB + Y-channel metrics.
-        Reports both RGB PSNR and Y-channel PSNR for fair comparison with SR literature.
-        """
         from utils.metrics import psnr, ssim, psnr_y, ssim_y
+        from data.datasets import generate_lr_on_gpu
 
         self.model.eval()
         total_psnr_rgb = 0.0
@@ -245,9 +238,11 @@ class Trainer:
         window_size = self.config["window_size"]
         scale = self.config["scale"]
 
-        for i, (lr_imgs, hr_imgs) in enumerate(sat_val_dl):
-            lr_imgs = lr_imgs.to(self.device)
+        for i, hr_imgs in enumerate(sat_val_dl):
             hr_imgs = hr_imgs.to(self.device).float()
+
+            # generate LR on GPU — deterministic (no augmentation during val)
+            lr_imgs = generate_lr_on_gpu(hr_imgs, scale=scale)
 
             # pad LR to window size
             _, _, h, w = lr_imgs.shape
