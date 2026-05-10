@@ -120,23 +120,27 @@ class Trainer:
         self.scaler.load_state_dict(ckpt["scaler"])
 
         if reset_best_psnr:
-            # new phase — reset scheduler, epoch counter, best PSNR
             self.best_psnr = 0.0
             self.start_epoch = 0
-            # reinitialize optimizer LR to match new config
+
+            if self.config["mode"] == "satellite":
+                lr_max = self.config["sat_lr_max"]
+                lr_min = self.config["sat_lr_min"]
+            else:
+                lr_max = self.config["lr_max"]
+                lr_min = self.config["lr_min"]
+
             for pg in self.optimizer.param_groups:
-                pg["lr"] = (
-                    self.config["sat_lr_max"]
-                    if self.config["mode"] == "satellite"
-                    else self.config["lr_max"]
-                )
-            # reinitialize scheduler from scratch
+                pg["lr"] = lr_max
+
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self.optimizer,
                 T_0=self.config["sgdr_t0"],
                 T_mult=1,
-                eta_min=self.config["lr_min"],
+                eta_min=lr_min,
             )
+            print(f"scheduler reset | lr_max={lr_max} | lr_min={lr_min}")
+
         else:
             if "scheduler" in ckpt:
                 self.scheduler.load_state_dict(ckpt["scheduler"])
