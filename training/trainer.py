@@ -112,23 +112,37 @@ class Trainer:
 
     def load_checkpoint(self, path: str, reset_best_psnr: bool = False):
         ckpt = torch.load(path, map_location=self.device)
-
-        # handle DataParallel wrapped vs unwrapped model
         if isinstance(self.model, nn.DataParallel):
             self.model.module.load_state_dict(ckpt["model"])
         else:
             self.model.load_state_dict(ckpt["model"])
-
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scaler.load_state_dict(ckpt["scaler"])
 
-        # restore scheduler position — skip if not in checkpoint (old format)
-        if "scheduler" in ckpt:
-            self.scheduler.load_state_dict(ckpt["scheduler"])
+        if reset_best_psnr:
+            # new phase — reset scheduler, epoch counter, best PSNR
+            self.best_psnr = 0.0
+            self.start_epoch = 0
+            # reinitialize optimizer LR to match new config
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = (
+                    self.config["sat_lr_max"]
+                    if self.config["mode"] == "satellite"
+                    else self.config["lr_max"]
+                )
+            # reinitialize scheduler from scratch
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=self.config["sgdr_t0"],
+                T_mult=1,
+                eta_min=self.config["lr_min"],
+            )
+        else:
+            if "scheduler" in ckpt:
+                self.scheduler.load_state_dict(ckpt["scheduler"])
+            self.best_psnr = ckpt["best_psnr"]
+            self.start_epoch = ckpt["epoch"] + 1
 
-        # reset best PSNR when switching domains (e.g. general SR → satellite)
-        self.best_psnr = 0.0 if reset_best_psnr else ckpt["best_psnr"]
-        self.start_epoch = ckpt["epoch"] + 1
         print(f"resumed from epoch {ckpt['epoch']} | best PSNR {self.best_psnr:.2f}dB")
 
     @staticmethod
