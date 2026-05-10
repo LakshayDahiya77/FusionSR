@@ -143,11 +143,18 @@ def main():
         lr_min = CONFIG["lr_min"]
 
     elif CONFIG["mode"] == "satellite":
-
         dior_base = CONFIG["dior_base"]
 
+        # copy to RAM disk first
+        dst = setup_ramdisk(
+            {
+                "dior_train": f"{dior_base}/train/images",
+                "dior_val": f"{dior_base}/val/images",
+            }
+        )
+
         train_dl = make_satellite_hr_dataloader(
-            hr_dir=f"{dior_base}/train/images",
+            hr_dir=dst["dior_train"],
             patch_hr=CONFIG["patch_hr"],
             scale=CONFIG["scale"],
             batch_size=CONFIG["sat_batch"],
@@ -156,7 +163,7 @@ def main():
         )
 
         valid_dl = make_satellite_hr_dataloader(
-            hr_dir=f"{dior_base}/val/images",
+            hr_dir=dst["dior_val"],
             patch_hr=CONFIG["patch_hr"],
             scale=CONFIG["scale"],
             batch_size=1,

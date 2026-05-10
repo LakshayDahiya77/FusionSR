@@ -49,14 +49,24 @@ class Trainer:
     def train_epoch(self, epoch: int) -> float:
         self.model.train()
         total_loss = 0.0
+        is_satellite = self.config.get("mode") == "satellite"
 
-        for lr_imgs, hr_imgs in self.train_dl:
-            lr_imgs = lr_imgs.to(self.device, non_blocking=True)
-            hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+        for batch in self.train_dl:
+            if is_satellite:
+                # batch is HR only — generate LR on GPU
+                hr_imgs = batch.to(self.device, non_blocking=True)
+                from data.datasets import generate_lr_on_gpu, gpu_augment
 
-            from data.datasets import gpu_augment
+                lr_imgs = generate_lr_on_gpu(hr_imgs, scale=self.config["scale"])
+                # augment both together
+                lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
+            else:
+                lr_imgs, hr_imgs = batch
+                lr_imgs = lr_imgs.to(self.device, non_blocking=True)
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+                from data.datasets import gpu_augment
 
-            lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
+                lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
 
             self.optimizer.zero_grad(set_to_none=True)
 

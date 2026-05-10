@@ -312,58 +312,46 @@ def make_satellite_val_loader(hr_dir: str, lr_dir: str) -> DataLoader:
 
 class SatelliteHRDataset(Dataset):
     """
-    Dataset for satellite imagery SR fine-tuning using synthetic degradation.
-    HR images are downscaled bicubically to generate LR on-the-fly.
-    Works for any HR-only dataset (DIOR, EuroSAT, UC Merced etc).
-    No pre-paired LR needed — LR generated from HR during training.
+    Dataset for satellite imagery SR fine-tuning.
+    Loads HR images only — LR generated on GPU in training loop.
+    Pre-loads all images into RAM for fast access.
     """
 
     def __init__(
         self,
         hr_dir: str,
-        patch_hr: int = 256,  # HR patch size, LR = patch_hr // scale
-        scale: int = 4,
+        patch_hr: int = 256,
         training: bool = True,
         extensions: tuple = (".jpg", ".png", ".jpeg"),
     ):
         super().__init__()
         self.patch_hr = patch_hr
-        self.patch_lr = patch_hr // scale
-        self.scale = scale
         self.training = training
 
-        self.hr_files = sorted(
+        hr_files = sorted(
             [p for p in Path(hr_dir).rglob("*") if p.suffix.lower() in extensions]
         )
-        assert len(self.hr_files) > 0, f"No images found in {hr_dir}"
-        print(f"SatelliteHRDataset: {len(self.hr_files)} images from {hr_dir}")
+        assert len(hr_files) > 0, f"No images found in {hr_dir}"
+
+        print(
+            f"pre-loading {len(hr_files)} satellite HR images...", end=" ", flush=True
+        )
+        self.hr_images = []
+        for p in hr_files:
+            hr = np.array(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
+            self.hr_images.append(hr)
+        print("done.")
 
     def __len__(self):
-        return len(self.hr_files)
+        return len(self.hr_images)
 
     def __getitem__(self, idx):
-        hr = Image.open(self.hr_files[idx]).convert("RGB")
-        hr = torch.from_numpy(np.array(hr, dtype=np.float32) / 255.0).permute(
-            2, 0, 1
-        )  # [3, H, W]
+        hr = torch.from_numpy(self.hr_images[idx]).permute(2, 0, 1)
 
         if self.training:
             hr = self._random_crop(hr)
 
-        # generate LR from HR via bicubic downscale
-        lr = (
-            F.interpolate(
-                hr.unsqueeze(0),
-                scale_factor=1.0 / self.scale,
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-            .squeeze(0)
-            .clamp(0, 1)
-        )
-
-        return lr, hr
+        return hr  # LR generated on GPU in training loop
 
     def _random_crop(self, hr: torch.Tensor) -> torch.Tensor:
         _, h, w = hr.shape
@@ -376,6 +364,30 @@ class SatelliteHRDataset(Dataset):
         x = torch.randint(0, w - p + 1, (1,)).item()
         y = torch.randint(0, h - p + 1, (1,)).item()
         return hr[:, y : y + p, x : x + p]
+
+
+def make_satellite_hr_dataloader(
+    hr_dir: str,
+    patch_hr: int = 256,
+    scale: int = 4,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    training: bool = True,
+) -> DataLoader:
+    ds = SatelliteHRDataset(
+        hr_dir=hr_dir,
+        patch_hr=patch_hr,
+        training=training,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=training,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=training,
+        persistent_workers=True if num_workers > 0 else False,
+    )
 
 
 def make_satellite_hr_dataloader(
@@ -405,3 +417,18 @@ def make_satellite_hr_dataloader(
         drop_last=training,
         persistent_workers=True if num_workers > 0 else False,
     )
+
+
+def generate_lr_on_gpu(hr: torch.Tensor, scale: int = 4) -> torch.Tensor:
+    """
+    Generate LR from HR via bicubic downscaling on GPU.
+    hr: [B, 3, H, W] on CUDA
+    returns: [B, 3, H//scale, W//scale] on CUDA
+    """
+    return F.interpolate(
+        hr,
+        scale_factor=1.0 / scale,
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    ).clamp(0, 1)
