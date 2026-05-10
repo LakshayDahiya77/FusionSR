@@ -369,44 +369,20 @@ class SatelliteHRDataset(Dataset):
 def make_satellite_hr_dataloader(
     hr_dir: str,
     patch_hr: int = 256,
-    scale: int = 4,
-    batch_size: int = 16,
-    num_workers: int = 4,
-    training: bool = True,
-) -> DataLoader:
-    ds = SatelliteHRDataset(
-        hr_dir=hr_dir,
-        patch_hr=patch_hr,
-        training=training,
-    )
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=training,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=training,
-        persistent_workers=True if num_workers > 0 else False,
-    )
-
-
-def make_satellite_hr_dataloader(
-    hr_dir: str,
-    patch_hr: int = 256,
-    scale: int = 4,
+    scale: int = 4,  # kept for API compatibility, used by GPU LR generation
     batch_size: int = 16,
     num_workers: int = 4,
     training: bool = True,
 ) -> DataLoader:
     """
-    Dataloader for satellite HR-only datasets with synthetic LR generation.
-    Use for DIOR, EuroSAT, UC Merced etc.
+    Dataloader for satellite HR-only datasets.
+    LR generated on GPU in training loop via generate_lr_on_gpu().
     """
     ds = SatelliteHRDataset(
         hr_dir=hr_dir,
         patch_hr=patch_hr,
-        scale=scale,
         training=training,
+        # scale NOT passed — LR generated on GPU, not in dataset
     )
     return DataLoader(
         ds,
