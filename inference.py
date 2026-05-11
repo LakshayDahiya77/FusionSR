@@ -27,25 +27,23 @@ MODEL_CONFIG = {
     "scale": 4,
 }
 
-CLASSICAL_ARTIFACT = "weights/fusionsr-v2-classical.pt"
-SATELLITE_ARTIFACT = "weights/fusionsr-v2-satellite.pt"
+def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
+    """Loads from HF Hub if given 'classical'/'satellite', else treats as local path."""
+    if model_identifier in ["classical", "satellite"]:
+        filename = f"fusionsr-v2-{model_identifier}.pt"
+        ckpt_path = hf_hub_download(
+            repo_id="lakshaydahiya/FusionSR-v2",
+            filename=filename,
+        )
+        print(f"loaded {filename} from HuggingFace Hub")
+    else:
+        ckpt_path = model_identifier
+        print(f"loaded local checkpoint from {ckpt_path}")
 
-
-def load_model(model_name: str, device: torch.device) -> torch.nn.Module:
-    filename = {
-        "classical": "fusionsr-v2-classical.pt",
-        "satellite": "fusionsr-v2-satellite.pt",
-    }[model_name]
-
-    ckpt_path = hf_hub_download(
-        repo_id="lakshaydahiya/FusionSR-v2",
-        filename=filename,
-    )
     ckpt = torch.load(ckpt_path, map_location=device)
     model = FusionSR(**MODEL_CONFIG).to(device)
     model.load_state_dict(ckpt.get("model", ckpt))
     model.eval()
-    print(f"loaded {filename} from HuggingFace Hub")
     return model
 
 

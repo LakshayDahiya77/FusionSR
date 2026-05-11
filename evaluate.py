@@ -35,9 +35,6 @@ DIOR_BASE = (
     "/kaggle/input/datasets/redzapdos123/dior-r-dataset-yolov11-obb-format/YOLODIOR-R"
 )
 
-CLASSICAL_ARTIFACT = "weights/fusionsr-v2-classical.pt"
-SATELLITE_ARTIFACT = "weights/fusionsr-v2-satellite.pt"
-
 MODEL_CONFIG = {
     "in_channels": 3,
     "out_channels": 3,
@@ -132,21 +129,23 @@ class HROnlyDataset(Dataset):
 # ─────────────────────────────────────────
 #  Model loader
 # ─────────────────────────────────────────
-def load_model(model_name: str, device: torch.device) -> torch.nn.Module:
-    filename = {
-        "classical": "fusionsr-v2-classical.pt",
-        "satellite": "fusionsr-v2-satellite.pt",
-    }[model_name]
+def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
+    """Loads from HF Hub if given 'classical'/'satellite', else treats as local path."""
+    if model_identifier in ["classical", "satellite"]:
+        filename = f"fusionsr-v2-{model_identifier}.pt"
+        ckpt_path = hf_hub_download(
+            repo_id="lakshaydahiya/FusionSR-v2",
+            filename=filename,
+        )
+        print(f"loaded {filename} from HuggingFace Hub")
+    else:
+        ckpt_path = model_identifier
+        print(f"loaded local checkpoint from {ckpt_path}")
 
-    ckpt_path = hf_hub_download(
-        repo_id="lakshaydahiya/FusionSR-v2",
-        filename=filename,
-    )
     ckpt = torch.load(ckpt_path, map_location=device)
     model = FusionSR(**MODEL_CONFIG).to(device)
     model.load_state_dict(ckpt.get("model", ckpt))
     model.eval()
-    print(f"loaded {filename} from HuggingFace Hub")
     return model
 
 
@@ -346,14 +345,15 @@ def main(args):
     models_to_eval = []
 
     if args.model in ("classical", "both"):
-        ckpt = args.classical_checkpoint or CLASSICAL_ARTIFACT
-        print(f"\nloading FusionSR-v2-Classical from {ckpt}")
+        # If no local checkpoint provided, pass "classical" to trigger HF download
+        ckpt = args.classical_checkpoint or "classical"
+        print(f"\nloading FusionSR-v2-Classical...")
         m = load_model(ckpt, device)
         models_to_eval.append(("FusionSR-v2-Classical", m, CLASSICAL_BENCHMARKS))
 
     if args.model in ("satellite", "both"):
-        ckpt = args.satellite_checkpoint or SATELLITE_ARTIFACT
-        print(f"\nloading FusionSR-v2-Satellite from {ckpt}")
+        ckpt = args.satellite_checkpoint or "satellite"
+        print(f"\nloading FusionSR-v2-Satellite...")
         m = load_model(ckpt, device)
         models_to_eval.append(("FusionSR-v2-Satellite", m, SATELLITE_BENCHMARKS))
 
