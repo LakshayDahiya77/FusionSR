@@ -111,11 +111,18 @@ class HROnlyDataset(Dataset):
         hr = torch.from_numpy(
             np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
         ).permute(2, 0, 1)
+        
+        # ── FIXED: Modulo Crop (ensure HR is divisible by scale) ──
+        _, h, w = hr.shape
+        crop_h = h - (h % self.scale)
+        crop_w = w - (w % self.scale)
+        hr = hr[:, :crop_h, :crop_w]
+
         # generate LR via bicubic
         lr = (
             F.interpolate(
                 hr.unsqueeze(0),
-                scale_factor=1.0 / self.scale,
+                size=(crop_h // self.scale, crop_w // self.scale), # Use exact size instead of scale_factor
                 mode="bicubic",
                 align_corners=False,
                 antialias=True,
@@ -124,7 +131,6 @@ class HROnlyDataset(Dataset):
             .clamp(0, 1)
         )
         return lr, hr, hr_path.name
-
 
 # ─────────────────────────────────────────
 #  Model loader
