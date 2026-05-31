@@ -1,3 +1,22 @@
+"""
+FusionSR-v3 building blocks.
+
+Components (from literature):
+    ChannelAttention       — squeeze-excite from RCAN (Zhang et al., 2018)
+    RCAB                   — residual channel attention block (RCAN)
+    GDFN                   — gated-dconv FFN from Restormer (Zamir et al., 2022)
+    ChannelAttentionBridge — cross-window bridge inspired by HAT (Chen et al., 2023)
+    WindowAttention        — window multi-head self-attention (SwinIR, Liang et al., 2021)
+    SwinBlock              — W-MSA / SW-MSA + GDFN (v3 upgrade)
+    SwinBlockPair          — W-MSA then SW-MSA with precomputed shift mask
+    ResidualGroup          — RCAB×N → CAB → SwinBlockPair → Conv → skip
+
+Changes from v2:
+    - Standard MLP FFN replaced with GDFN in SwinBlock
+    - ChannelAttentionBridge inserted between RCAB and Swin stages
+    - DualPathExtractor removed (replaced by single conv in fusionsr.py)
+"""
+
 import math
 import torch
 import torch.nn as nn
@@ -5,16 +24,32 @@ import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────
-#  Channel Attention
+#  Normalization Utilities
 # ─────────────────────────────────────────
+
+class ChannelLayerNorm(nn.Module):
+    """
+    LayerNorm for [B, C, H, W] tensors.
+    Internally permutes to [B, H, W, C], applies LayerNorm, permutes back.
+    Used before GDFN which operates in BCHW format.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+# ─────────────────────────────────────────
+#  Channel Attention (RCAN)
+# ─────────────────────────────────────────
+
 class ChannelAttention(nn.Module):
     """
     Squeeze-and-excite channel attention from RCAN.
-    1. GAP: squeezes spatial dims → [B, C, 1, 1]
-    2. Two FC layers learn channel importance scores
-    3. Sigmoid gates each channel in [0, 1]
-    4. Scale original feature map by these gates
-
+    GAP → FC → ReLU → FC → Sigmoid → scale.
     """
 
     def __init__(self, channels: int, reduction: int = 16):
@@ -29,19 +64,18 @@ class ChannelAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scale = self.fc(self.gap(x))  # [B, C, 1, 1]
-        return x * scale  # broadcast across H, W
+        return x * self.fc(self.gap(x))
 
 
 # ─────────────────────────────────────────
 #  RCAB — Residual Channel Attention Block
 # ─────────────────────────────────────────
+
 class RCAB(nn.Module):
     """
     Residual Channel Attention Block from RCAN.
-    conv → GELU → conv → ChannelAttention → residual scaling → skip
-    No BatchNorm anywhere (EDSR principle).
-
+    Conv → GELU → Conv → ChannelAttention → residual scaling → skip.
+    No BatchNorm (EDSR principle).
     """
 
     def __init__(self, channels: int, reduction: int = 16, res_scale: float = 0.1):
@@ -55,54 +89,107 @@ class RCAB(nn.Module):
         self.ca = ChannelAttention(channels, reduction)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = self.ca(self.body(x)) * self.res_scale
-        return x + res
+        return x + self.ca(self.body(x)) * self.res_scale
 
 
 # ─────────────────────────────────────────
-#  Swin Transformer components
+#  GDFN — Gated-DConv Feed-Forward Network
 # ─────────────────────────────────────────
 
+class GDFN(nn.Module):
+    """
+    Gated-DConv Feed-Forward Network from Restormer (Zamir et al., 2022 §3.2).
+
+    Replaces standard Linear→GELU→Linear FFN with a spatially-aware
+    gated network:
+        1. 1×1 conv projects to 2×hidden channels (for gating)
+        2. Depthwise 3×3 conv injects local spatial context
+        3. Split into two halves — one gates the other via GELU
+        4. 1×1 conv projects back to original channels
+
+    This addresses v2's limitation of spatial-unaware FFN in Swin blocks.
+    Operates in [B, C, H, W] format (Conv2d-based).
+    """
+
+    def __init__(self, channels: int, expansion: float = 2.0):
+        super().__init__()
+        hidden = int(channels * expansion)
+        # expand to 2×hidden for the gating split
+        self.project_in = nn.Conv2d(channels, hidden * 2, 1, bias=True)
+        # depthwise conv adds 3×3 local spatial context
+        self.dwconv = nn.Conv2d(
+            hidden * 2, hidden * 2, 3, padding=1, groups=hidden * 2, bias=True
+        )
+        self.project_out = nn.Conv2d(hidden, channels, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.project_in(x)         # [B, 2*hidden, H, W]
+        x = self.dwconv(x)             # depthwise 3×3 for spatial awareness
+        x1, x2 = x.chunk(2, dim=1)     # each [B, hidden, H, W]
+        x = x1 * F.gelu(x2)            # gating: x1 modulated by activated x2
+        return self.project_out(x)      # [B, C, H, W]
+
+
+# ─────────────────────────────────────────
+#  Channel Attention Bridge (HAT-inspired)
+# ─────────────────────────────────────────
+
+class ChannelAttentionBridge(nn.Module):
+    """
+    Channel attention bridge inspired by HAT (Chen et al., 2023).
+
+    Placed between the RCAB stack (local CNN features) and SwinBlockPair
+    (windowed transformer attention). The global average pooling aggregates
+    information across ALL spatial positions, enabling cross-window
+    information flow before the windowed self-attention stage.
+
+    This bridges the gap: RCAB produces local features confined to conv
+    receptive fields → CAB creates a globally-informed representation →
+    Swin blocks attend within windows but start from globally-aware features.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.body = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid, 1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(mid, channels, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.body(x)  # global channel gating
+
+
+# ─────────────────────────────────────────
+#  Swin Transformer Components
+# ─────────────────────────────────────────
 
 def window_partition(x: torch.Tensor, window_size: int):
+    """Split [B, H, W, C] feature map into non-overlapping windows.
+    Returns [num_windows*B, window_size, window_size, C].
     """
-    Split feature map into non-overlapping windows.
-    x: [B, H, W, C]
-    returns: [num_windows*B, window_size, window_size, C]
-
-    """
-
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-    windows = windows.view(-1, window_size, window_size, C)
-    return windows
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
 
 
 def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
+    """Reconstruct [B, H, W, C] feature map from windows.
+    windows: [num_windows*B, window_size, window_size, C].
     """
-    Reconstruct feature map from windows.
-    windows: [num_windows*B, window_size, window_size, C]
-    returns: [B, H, W, C]
-
-    """
-
-    B_times_nW = windows.shape[0]
     nW = (H // window_size) * (W // window_size)
-    B = B_times_nW // nW
-    x = windows.view(
-        B, H // window_size, W // window_size, window_size, window_size, -1
-    )
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-    x = x.view(B, H, W, -1)
-    return x
+    B = windows.shape[0] // nW
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
 
 
 class WindowAttention(nn.Module):
     """
-    Window-based multi-head self-attention (W-MSA / SW-MSA).
-    Includes relative position bias.
-
+    Window-based multi-head self-attention with relative position bias.
+    Used for both W-MSA and SW-MSA (SwinIR, Liang et al., 2021).
     """
 
     def __init__(self, channels: int, window_size: int, num_heads: int):
@@ -111,47 +198,42 @@ class WindowAttention(nn.Module):
         self.window_size = window_size
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
-        self.scale = self.head_dim**-0.5
+        self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(channels, channels * 3, bias=True)
         self.proj = nn.Linear(channels, channels, bias=True)
 
-        # relative position bias table
+        # relative position bias table and index
         self.rel_pos_bias_table = nn.Parameter(
             torch.zeros((2 * window_size - 1) ** 2, num_heads)
         )
         nn.init.trunc_normal_(self.rel_pos_bias_table, std=0.02)
 
-        # precompute relative position index
         coords_h = torch.arange(window_size)
         coords_w = torch.arange(window_size)
-        coords = torch.stack(
-            torch.meshgrid(coords_h, coords_w, indexing="ij")
-        )  # [2, W, W]
-        coords_flat = coords.flatten(1)  # [2, W*W]
-        relative = coords_flat[:, :, None] - coords_flat[:, None, :]  # [2, W*W, W*W]
-        relative = relative.permute(1, 2, 0).contiguous()  # [W*W, W*W, 2]
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
+        coords_flat = coords.flatten(1)
+        relative = coords_flat[:, :, None] - coords_flat[:, None, :]
+        relative = relative.permute(1, 2, 0).contiguous()
         relative[:, :, 0] += window_size - 1
         relative[:, :, 1] += window_size - 1
         relative[:, :, 0] *= 2 * window_size - 1
-        rel_pos_index = relative.sum(-1)  # [W*W, W*W]
-        self.register_buffer("rel_pos_index", rel_pos_index)
+        self.register_buffer("rel_pos_index", relative.sum(-1))
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
-        B_, N, C = x.shape  # B_ = num_windows * B, N = window_size^2
+        B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # each [B_, num_heads, N, head_dim]
+        q, k, v = qkv.unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)  # [B_, heads, N, N]
+        attn = (q * self.scale) @ k.transpose(-2, -1)
 
-        # add relative position bias
+        # relative position bias
         bias = self.rel_pos_bias_table[self.rel_pos_index.view(-1)]
-        bias = bias.view(self.window_size**2, self.window_size**2, self.num_heads)
-        bias = bias.permute(2, 0, 1).contiguous().unsqueeze(0)  # [1, heads, N, N]
+        bias = bias.view(N, N, self.num_heads).permute(2, 0, 1).unsqueeze(0)
         attn = attn + bias
 
-        # apply shift mask if SW-MSA
+        # shift mask for SW-MSA
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
@@ -160,16 +242,21 @@ class WindowAttention(nn.Module):
 
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        return x
+        return self.proj(x)
 
 
 class SwinBlock(nn.Module):
     """
-    One Swin Transformer block — either W-MSA or SW-MSA.
-    LayerNorm → attention → skip
-    LayerNorm → FFN → skip
+    Swin Transformer block with GDFN (v3 upgrade).
 
+    Attention branch: LayerNorm → [shift] → window partition → attention →
+                      window reverse → [unshift] → skip
+    FFN branch:       ChannelLayerNorm → GDFN → skip
+
+    Key change from v2: standard Linear→GELU→Linear FFN replaced with GDFN
+    for local spatial awareness in the feed-forward path.
+
+    Attention operates in [B, H, W, C]; GDFN operates in [B, C, H, W].
     """
 
     def __init__(
@@ -177,78 +264,85 @@ class SwinBlock(nn.Module):
         channels: int,
         window_size: int,
         num_heads: int,
-        shift: bool = False,  # False = W-MSA, True = SW-MSA
-        ffn_ratio: float = 2.0,
+        shift: bool = False,
+        ffn_expansion: float = 2.0,
     ):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2 if shift else 0
 
+        # attention branch (BHWC)
         self.norm1 = nn.LayerNorm(channels)
         self.attn = WindowAttention(channels, window_size, num_heads)
-        self.norm2 = nn.LayerNorm(channels)
 
-        ffn_dim = int(channels * ffn_ratio)
-        self.ffn = nn.Sequential(
-            nn.Linear(channels, ffn_dim),
-            nn.GELU(),
-            nn.Linear(ffn_dim, channels),
-        )
+        # GDFN branch (BCHW)
+        self.norm2 = ChannelLayerNorm(channels)
+        self.gdfn = GDFN(channels, expansion=ffn_expansion)
 
     def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
         B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1)  # [B, H, W, C] — Swin works in HWC
 
-        shortcut = x
-        x = self.norm1(x)
+        # ── attention branch (BHWC) ──
+        x_bhwc = x.permute(0, 2, 3, 1)  # [B, H, W, C]
+        shortcut = x_bhwc
+        x_bhwc = self.norm1(x_bhwc)
 
         # cyclic shift for SW-MSA
         if self.shift_size > 0:
-            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            x_bhwc = torch.roll(
+                x_bhwc, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)
+            )
 
-        # partition into windows
-        x_windows = window_partition(x, self.window_size)  # [nW*B, ws, ws, C]
-        x_windows = x_windows.view(-1, self.window_size**2, C)  # [nW*B, ws^2, C]
-
-        # attention
-        x_windows = self.attn(x_windows, mask=attn_mask)
-
-        # reverse windows
-        x_windows = x_windows.view(-1, self.window_size, self.window_size, C)
-        x = window_reverse(x_windows, self.window_size, H, W)  # [B, H, W, C]
+        # window partition → attention → window reverse
+        windows = window_partition(x_bhwc, self.window_size)
+        windows = windows.view(-1, self.window_size ** 2, C)
+        windows = self.attn(windows, mask=attn_mask)
+        windows = windows.view(-1, self.window_size, self.window_size, C)
+        x_bhwc = window_reverse(windows, self.window_size, H, W)
 
         # reverse cyclic shift
         if self.shift_size > 0:
-            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            x_bhwc = torch.roll(
+                x_bhwc, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
+            )
 
-        x = shortcut + x
+        x_bhwc = shortcut + x_bhwc  # attention skip
 
-        # FFN
-        x = x + self.ffn(self.norm2(x))
+        # ── GDFN branch (BCHW) ──
+        x = x_bhwc.permute(0, 3, 1, 2)   # [B, C, H, W]
+        x = x + self.gdfn(self.norm2(x))  # GDFN skip
 
-        x = x.permute(0, 3, 1, 2)  # back to [B, C, H, W]
         return x
 
 
 class SwinBlockPair(nn.Module):
     """
     W-MSA block followed by SW-MSA block.
-    The pair ensures cross-boundary information flow.
+    The pair ensures cross-boundary information flow via shifted windows.
     Precomputes the shift mask once for efficiency.
-
     """
 
-    def __init__(self, channels: int, window_size: int, num_heads: int):
+    def __init__(
+        self,
+        channels: int,
+        window_size: int,
+        num_heads: int,
+        ffn_expansion: float = 2.0,
+    ):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
 
-        self.w_msa = SwinBlock(channels, window_size, num_heads, shift=False)
-        self.sw_msa = SwinBlock(channels, window_size, num_heads, shift=True)
-
-        self._attn_mask = None  # computed lazily on first forward
+        self.w_msa = SwinBlock(
+            channels, window_size, num_heads, shift=False, ffn_expansion=ffn_expansion
+        )
+        self.sw_msa = SwinBlock(
+            channels, window_size, num_heads, shift=True, ffn_expansion=ffn_expansion
+        )
+        self._attn_mask = None
 
     def _compute_mask(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Compute attention mask for shifted window self-attention."""
         img_mask = torch.zeros(1, H, W, 1, device=device)
         h_slices = (
             slice(0, -self.window_size),
@@ -266,8 +360,8 @@ class SwinBlockPair(nn.Module):
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-        mask_windows = window_partition(img_mask, self.window_size)  # [nW, ws, ws, 1]
-        mask_windows = mask_windows.view(-1, self.window_size**2)
+        mask_windows = window_partition(img_mask, self.window_size)
+        mask_windows = mask_windows.view(-1, self.window_size ** 2)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0)
         attn_mask = attn_mask.masked_fill(attn_mask == 0, 0.0)
@@ -276,6 +370,7 @@ class SwinBlockPair(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
 
+        # recompute mask if spatial size or device changed
         if (
             self._attn_mask is None
             or self._attn_mask.device != x.device
@@ -290,70 +385,23 @@ class SwinBlockPair(nn.Module):
 
 
 # ─────────────────────────────────────────
-#  Dual-Path Shallow Feature Extractor
-# ─────────────────────────────────────────
-class DualPathExtractor(nn.Module):
-    """
-    Two parallel paths for shallow feature extraction (from FusionSR).
-
-    Path A — general: simple conv stack, fast, low-level features
-    Path B — attention: same but with two RCAB blocks for richer features
-
-    Output is a learned weighted blend:
-        out = (1 - sigmoid(w)) * A + sigmoid(w) * B
-        w initialized to -2.0 → sigmoid ≈ 0.12 (mostly Path A early in training)
-
-    The network learns how much to rely on the attention path.
-
-    """
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-
-        # Path A — general
-        self.path_a = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, 1, bias=True),
-        )
-
-        # Path B — attention enhanced
-        self.path_b = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=True),
-            nn.GELU(),
-            RCAB(out_channels),
-            RCAB(out_channels),
-            nn.Conv2d(out_channels, out_channels, 1, bias=True),
-        )
-
-        # learnable mixing scalar — init at -2.0 so sigmoid ≈ 0.12
-        self.mix_weight = nn.Parameter(torch.tensor(-2.0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = self.path_a(x)
-        b = self.path_b(x)
-        mix = torch.sigmoid(self.mix_weight)
-        return (1.0 - mix) * a + mix * b
-
-
-# ─────────────────────────────────────────
 #  Residual Group
 # ─────────────────────────────────────────
+
 class ResidualGroup(nn.Module):
     """
-    One residual group — the repeating unit of Stage 2.
+    Residual group — the repeating unit of Stage 2 (v3).
 
     Structure:
-        4x RCAB blocks  (local features, channel attention)
-        1x SwinBlockPair (global context, shifted window attention)
-        Conv 3x3
-        Group-level skip connection
+        RCAB × N                (local features, channel attention)
+        ChannelAttentionBridge  (global channel bridge — HAT-inspired)
+        SwinBlockPair           (global spatial context, shifted window + GDFN)
+        Conv 3×3                (feature refinement)
+        Group-level skip        (residual learning)
 
-    The group-level skip means the entire group only needs to
-    learn a residual, not a full transformation.
-
+    The CAB between RCAB and Swin enables cross-window information flow:
+    RCAB outputs are locally confined → CAB applies global channel gating →
+    Swin blocks start from globally-informed features.
     """
 
     def __init__(
@@ -361,16 +409,18 @@ class ResidualGroup(nn.Module):
         channels: int,
         window_size: int,
         num_heads: int,
-        num_rcab: int = 4,
+        num_rcab: int = 6,
+        ffn_expansion: float = 2.0,
     ):
         super().__init__()
-
         self.rcab_blocks = nn.Sequential(*[RCAB(channels) for _ in range(num_rcab)])
-        self.swin_pair = SwinBlockPair(channels, window_size, num_heads)
+        self.cab = ChannelAttentionBridge(channels)
+        self.swin_pair = SwinBlockPair(channels, window_size, num_heads, ffn_expansion)
         self.conv = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = self.rcab_blocks(x)
-        res = self.swin_pair(res)
-        res = self.conv(res)
-        return x + res  # group skip
+        res = self.rcab_blocks(x)   # local CNN features
+        res = self.cab(res)         # global channel bridge
+        res = self.swin_pair(res)   # global spatial attention + GDFN
+        res = self.conv(res)        # refinement
+        return x + res              # group skip

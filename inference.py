@@ -25,6 +25,7 @@ MODEL_CONFIG = {
     "window_size": 8,
     "num_heads": 4,
     "scale": 4,
+    "ffn_expansion": 2.0,
 }
 
 def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
@@ -59,22 +60,13 @@ def download_artifact(artifact_name: str) -> str:
 
 
 @torch.no_grad()
-def upscale(model, img_tensor, device, window_size=8, scale=4):
-    """Run SR model on image tensor."""
+def upscale(model, img_tensor, device, scale=4):
+    """Run SR model on image tensor. Window padding handled by model."""
     lr = img_tensor.unsqueeze(0).to(device)  # [1, 3, H, W]
-
-    # pad to window size
-    _, _, h, w = lr.shape
-    pad_h = (window_size - h % window_size) % window_size
-    pad_w = (window_size - w % window_size) % window_size
-    if pad_h > 0 or pad_w > 0:
-        lr = F.pad(lr, (0, pad_w, 0, pad_h), mode="reflect")
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
         sr = model(lr).float().clamp(0, 1)
 
-    # crop to expected output size
-    sr = sr[:, :, : h * scale, : w * scale]
     return sr.squeeze(0)
 
 
@@ -107,7 +99,6 @@ def main(args):
         model,
         img_tensor,
         device,
-        window_size=MODEL_CONFIG["window_size"],
         scale=MODEL_CONFIG["scale"],
     )
 

@@ -1,23 +1,45 @@
+"""
+FusionSR-v3 training entry point.
+
+Usage (Kaggle notebook Cell 2):
+
+    import train
+
+    train.CONFIG['epochs']       = 50
+    train.CONFIG['lr_max']       = 2e-4
+    train.CONFIG['batch_size']   = 24
+    train.CONFIG['patch_lr']     = 96
+    train.CONFIG['validate_every'] = 1
+    train.CONFIG['wandb_run']    = 'v3-phase1-part1'
+
+    # for resuming:
+    # train.CONFIG['resume']       = 'wandb'
+    # train.CONFIG['wandb_run_id'] = '<run_id>'
+
+    train.main()
+"""
+
 import os
 import torch
 import wandb
-from kaggle_secrets import UserSecretsClient
-from training.trainer import Trainer
+
 from models.fusionsr import FusionSR, count_parameters
-from models.losses import CharbonnierLoss
+from models.losses import CombinedSRLoss
+from training.trainer import Trainer
 from data.datasets import (
+    setup_ramdisk,
     make_train_dataloader,
     make_combined_dataloader,
-    make_satellite_hr_dataloader,
     make_benchmark_loader,
-    setup_ramdisk,
 )
 
-# ─────────────────────────────────────────
-#  Config
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFIG — override in notebook Cell 2 before calling main()
+# ─────────────────────────────────────────────────────────────────────────────
+
 CONFIG = {
-    # ── model ──
+    # ── model architecture ──
     "in_channels": 3,
     "out_channels": 3,
     "channels": 96,
@@ -26,60 +48,69 @@ CONFIG = {
     "window_size": 8,
     "num_heads": 4,
     "scale": 4,
-    # ── training mode ──
-    # "general_sr"  → pretrain on DIV2K / DIV2K+Flickr2K
-    # "satellite"   → fine-tune on satellite dataset (DIOR)
-    "mode": "general_sr",
-    # ── general SR data ──
+    "ffn_expansion": 2.0,
+
+    # ── training ──
+    "mode": "general_sr",       # "general_sr" | "satellite"
+    "epochs": 50,               # epochs per session
+    "lr_max": 2e-4,             # peak learning rate
+    "lr_min": 1e-6,             # minimum learning rate
+    "sgdr_t0": 50,              # cosine period (matches session length)
+    "batch_size": 24,           # per-GPU batch (×2 via DataParallel)
+    "patch_lr": 96,             # LR patch size (HR = 384)
+    "num_workers": 4,           # dataloader workers
+
+    # ── optimizer (AdamW) ──
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,           # gradient clipping max norm (0 = off)
+    "warmup_epochs": 5,         # linear LR warm-up from lr_min to lr_max
+
+    # ── validation ──
+    "validate_every": 1,
+
+    # ── loss ──
+    "use_perceptual": False,    # VGG perceptual loss
+    "perceptual_weight": 1.0,
+    "use_gan": False,           # adversarial loss (disabled by default)
+    "gan_weight": 0.005,
+
+    # ── real-world degradation ──
+    "use_degradation": False,   # Real-ESRGAN degradation pipeline
+
+    # ── data paths (Kaggle) ──
     "div2k_base": "/kaggle/input/datasets/takihasan/div2k-dataset-for-super-resolution/Dataset",
     "flickr_base": "/kaggle/input/datasets/hliang001/flickr2k/Flickr2K",
-    "use_flickr": True,  # True = DIV2K + Flickr2K, False = DIV2K only
-    # ── satellite data (DIOR) ──
-    "dior_base": "/kaggle/input/datasets/redzapdos123/dior-r-dataset-yolov11-obb-format/YOLODIOR-R",
-    "patch_hr": 256,  # HR patch size for satellite (LR = 256//4 = 64)
-    # ── benchmarks ──
+    "use_flickr": True,         # DIV2K + Flickr2K
     "bench_base": "/kaggle/input/datasets/jesucristo/super-resolution-benchmarks",
-    # ── general SR training hyperparams ──
-    "epochs": 50,
-    "lr_max": 2e-4,
-    "lr_min": 1e-6,
-    "sgdr_t0": 50,
-    "batch_size": 32,
-    "patch_lr": 64,
-    "num_workers": 4,
-    "validate_every": 1,
-    # ── satellite fine-tune hyperparams ──
-    "sat_lr_max": 5e-5,  # lower LR — preserve pretrained weights
-    "sat_lr_min": 1e-7,
-    "sat_sgdr_t0": 50,
-    "sat_batch": 16,
-    # ── wandb ──
+
+    # ── W&B ──
     "wandb_project": "FusionSR",
-    "wandb_run": "phase1-div2k-flickr",  # name for fresh runs
-    "wandb_run_id": None,  # set to resume existing run e.g. "gvolrfd3"
+    "wandb_run": "v3-phase1",
+    "wandb_run_id": None,       # set to resume existing run
+
     # ── resume ──
-    "resume": None,  # None | "wandb" | "/path/to/checkpoint.pt"
-    "reset_best_psnr": False,  # set True when switching general SR → satellite
+    "resume": None,             # None | "wandb" | "/path/to/ckpt.pt"
+    "reset_best_psnr": False,   # reset best PSNR and scheduler on resume
+
     # ── paths ──
     "save_dir": "/kaggle/working/checkpoints",
-    "max_images": None,  # set to small number for smoke test
 }
 
 
-# ─────────────────────────────────────────
-#  Main
-# ─────────────────────────────────────────
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
+    print(f"\ndevice: {device}")
+
+    # ── GPU info ──
     if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f}GB")
+        n_gpu = torch.cuda.device_count()
+        for i in range(n_gpu):
+            props = torch.cuda.get_device_properties(i)
+            print(f"GPU {i}: {props.name} ({props.total_mem / 1024**3:.1f}GB)")
+    else:
+        n_gpu = 0
 
     # ── W&B ──
-    secrets = UserSecretsClient()
-    wandb.login(key=secrets.get_secret("WANDB_API_KEY"))
-
     if CONFIG["resume"] and CONFIG["wandb_run_id"]:
         run = wandb.init(
             project=CONFIG["wandb_project"],
@@ -92,93 +123,44 @@ def main():
             name=CONFIG["wandb_run"],
             config=CONFIG,
         )
-    print(f"W&B run ID: {run.id}")
+    print(f"W&B run ID: {run.id}\n")
 
     # ── dataloaders ──
-    if CONFIG["mode"] == "general_sr":
+    div2k_base = CONFIG["div2k_base"]
 
-        div2k_base = CONFIG["div2k_base"]
+    if CONFIG["use_flickr"]:
         flickr_base = CONFIG["flickr_base"]
-
-        if CONFIG["use_flickr"]:
-            # Flickr2K in RAM disk, DIV2K from SSD
-            dst = setup_ramdisk(
-                {
-                    "flickr_hr": f"{flickr_base}/Flickr2K_HR",
-                    "flickr_lr": f"{flickr_base}/Flickr2K_LR_bicubic/X4",
-                }
-            )
-            train_dl = make_combined_dataloader(
-                div2k_hr=f"{div2k_base}/DIV2K_train_HR",
-                div2k_lr=f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
-                flickr_hr=dst["flickr_hr"],
-                flickr_lr=dst["flickr_lr"],
-                patch_lr=CONFIG["patch_lr"],
-                batch_size=CONFIG["batch_size"],
-                num_workers=CONFIG["num_workers"],
-            )
-        else:
-            # DIV2K only
-            dst = setup_ramdisk(
-                {
-                    "train_hr": f"{div2k_base}/DIV2K_train_HR",
-                    "train_lr": f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
-                }
-            )
-            train_dl = make_train_dataloader(
-                train_hr=dst["train_hr"],
-                train_lr=dst["train_lr"],
-                patch_lr=CONFIG["patch_lr"],
-                batch_size=CONFIG["batch_size"],
-                num_workers=CONFIG["num_workers"],
-            )
-
-        # validation — Set5
-        bench_base = CONFIG["bench_base"]
-        valid_dl = make_benchmark_loader(
-            hr_dir=f"{bench_base}/Set5/Set5/GTmod12",
-            lr_dir=f"{bench_base}/Set5/Set5/LRbicx4",
-        )
-
-        lr_max = CONFIG["lr_max"]
-        lr_min = CONFIG["lr_min"]
-
-    elif CONFIG["mode"] == "satellite":
-        from data.datasets import make_dior_dataloader
-
-        dior_base = CONFIG["dior_base"]
-
-        dst = setup_ramdisk(
-            {
-                "dior_train": f"{dior_base}/train/images",
-                "dior_val": f"{dior_base}/val/images",
-            }
-        )
-
-        train_dl = make_dior_dataloader(
-            hr_dir=dst["dior_train"],
-            patch_hr=CONFIG["patch_hr"],
-            batch_size=CONFIG["sat_batch"],
+        dst = setup_ramdisk({
+            "flickr_hr": f"{flickr_base}/Flickr2K_HR",
+            "flickr_lr": f"{flickr_base}/Flickr2K_LR_bicubic/X4",
+        })
+        train_dl = make_combined_dataloader(
+            div2k_hr=f"{div2k_base}/DIV2K_train_HR",
+            div2k_lr=f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
+            flickr_hr=dst["flickr_hr"],
+            flickr_lr=dst["flickr_lr"],
+            patch_lr=CONFIG["patch_lr"],
+            batch_size=CONFIG["batch_size"],
             num_workers=CONFIG["num_workers"],
-            training=True,
-            max_images=CONFIG.get("max_images"),  # None in full run
         )
-
-        valid_dl = make_dior_dataloader(
-            hr_dir=dst["dior_val"],
-            patch_hr=CONFIG["patch_hr"],
-            batch_size=1,
-            num_workers=2,
-            training=False,
-            max_images=CONFIG.get("max_images"),
-        )
-
-        lr_max = CONFIG["sat_lr_max"]
-        lr_min = CONFIG["sat_lr_min"]
-        CONFIG["sgdr_t0"] = CONFIG["sat_sgdr_t0"]
-
     else:
-        raise ValueError(f"unknown mode: {CONFIG['mode']}")
+        dst = setup_ramdisk({
+            "train_hr": f"{div2k_base}/DIV2K_train_HR",
+            "train_lr": f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
+        })
+        train_dl = make_train_dataloader(
+            train_hr=dst["train_hr"],
+            train_lr=dst["train_lr"],
+            patch_lr=CONFIG["patch_lr"],
+            batch_size=CONFIG["batch_size"],
+            num_workers=CONFIG["num_workers"],
+        )
+
+    bench_base = CONFIG["bench_base"]
+    valid_dl = make_benchmark_loader(
+        hr_dir=f"{bench_base}/Set5/Set5/GTmod12",
+        lr_dir=f"{bench_base}/Set5/Set5/LRbicx4",
+    )
 
     print(f"train batches: {len(train_dl)} | valid images: {len(valid_dl)}")
 
@@ -192,18 +174,51 @@ def main():
         window_size=CONFIG["window_size"],
         num_heads=CONFIG["num_heads"],
         scale=CONFIG["scale"],
+        ffn_expansion=CONFIG["ffn_expansion"],
     )
 
-    if torch.cuda.device_count() > 1:
-        print(f"using {torch.cuda.device_count()} GPUs via DataParallel")
+    # DataParallel for T4×2 — batch split across GPUs
+    if n_gpu > 1:
+        print(f"using {n_gpu} GPUs via DataParallel")
         model = torch.nn.DataParallel(model)
-
     model = model.to(device)
-    print(f"parameters: {count_parameters(model)/1e6:.2f}M")
+    print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
-    # ── loss + optimizer ──
-    loss_fn = CharbonnierLoss(eps=1e-3)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr_max)
+    # ── loss ──
+    loss_fn = CombinedSRLoss(
+        pixel_weight=1.0,
+        perceptual_weight=CONFIG["perceptual_weight"],
+        use_perceptual=CONFIG["use_perceptual"],
+    ).to(device)
+
+    # ── optimizer (AdamW — better for transformers than Adam) ──
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=CONFIG["lr_max"],
+        weight_decay=CONFIG["weight_decay"],
+        betas=(0.9, 0.999),
+    )
+
+    # ── optional: discriminator ──
+    discriminator = None
+    disc_optimizer = None
+    if CONFIG["use_gan"]:
+        from models.discriminator import VGGStyleDiscriminator
+        discriminator = VGGStyleDiscriminator()
+        if n_gpu > 1:
+            discriminator = torch.nn.DataParallel(discriminator)
+        discriminator = discriminator.to(device)
+        disc_optimizer = torch.optim.AdamW(
+            discriminator.parameters(), lr=1e-4, weight_decay=0.01,
+        )
+        print(f"discriminator: {count_parameters(discriminator) / 1e6:.2f}M")
+
+    # ── optional: degradation pipeline ──
+    degradation_fn = None
+    if CONFIG["use_degradation"]:
+        from data.degradation import RealESRGANDegradation
+        degradation_fn = RealESRGANDegradation(scale=CONFIG["scale"]).to(device)
+        print("real-world degradation pipeline: enabled")
 
     # ── trainer ──
     trainer = Trainer(
@@ -215,6 +230,9 @@ def main():
         config=CONFIG,
         device=device,
         save_dir=CONFIG["save_dir"],
+        discriminator=discriminator,
+        disc_optimizer=disc_optimizer,
+        degradation_fn=degradation_fn,
     )
 
     # ── resume ──
@@ -222,57 +240,37 @@ def main():
         ckpt_path = Trainer.download_checkpoint(CONFIG["wandb_project"])
         trainer.load_checkpoint(ckpt_path, reset_best_psnr=CONFIG["reset_best_psnr"])
     elif CONFIG["resume"]:
-        trainer.load_checkpoint(
-            CONFIG["resume"], reset_best_psnr=CONFIG["reset_best_psnr"]
-        )
+        trainer.load_checkpoint(CONFIG["resume"], reset_best_psnr=CONFIG["reset_best_psnr"])
 
     # ── train ──
     trainer.fit(
         epochs=CONFIG["epochs"],
-        lr_max=lr_max,
-        lr_min=lr_min,
+        lr_max=CONFIG["lr_max"],
+        lr_min=CONFIG["lr_min"],
         validate_every=CONFIG["validate_every"],
     )
 
-    # ── post-training benchmark eval ──
-    if CONFIG["mode"] == "general_sr":
-        print("\nrunning benchmark evaluation...")
-        bench_base = CONFIG["bench_base"]
-        for name, hr_sub, lr_sub in [
-            ("Set5", "Set5/Set5/GTmod12", "Set5/Set5/LRbicx4"),
-            ("Set14", "Set14/Set14/GTmod12", "Set14/Set14/LRbicx4"),
-        ]:
-            dl = make_benchmark_loader(
-                hr_dir=f"{bench_base}/{hr_sub}",
-                lr_dir=f"{bench_base}/{lr_sub}",
-            )
-            m = trainer.validate_benchmark(dl, name)
-            print(f"{name:6s} — PSNR: {m['psnr']:.2f}dB | SSIM: {m['ssim']:.4f}")
-            wandb.log(
-                {
-                    f"benchmark/{name}/psnr": m["psnr"],
-                    f"benchmark/{name}/ssim": m["ssim"],
-                }
-            )
-
-    elif CONFIG["mode"] == "satellite":
-        print("\nrunning final satellite validation...")
-        m = trainer.validate_satellite(valid_dl, "DIOR-val")
-        print(
-            f"DIOR val — RGB PSNR: {m['psnr_rgb']:.2f}dB | "
-            f"Y PSNR: {m['psnr_y']:.2f}dB | "
-            f"SSIM Y: {m['ssim_y']:.4f}"
+    # ── post-training benchmark ──
+    print("\n" + "=" * 60)
+    print("post-training benchmark evaluation")
+    print("=" * 60)
+    for name, hr_sub, lr_sub in [
+        ("Set5", "Set5/Set5/GTmod12", "Set5/Set5/LRbicx4"),
+        ("Set14", "Set14/Set14/GTmod12", "Set14/Set14/LRbicx4"),
+    ]:
+        dl = make_benchmark_loader(
+            hr_dir=f"{bench_base}/{hr_sub}",
+            lr_dir=f"{bench_base}/{lr_sub}",
         )
-        wandb.log(
-            {
-                "final/psnr_rgb": m["psnr_rgb"],
-                "final/psnr_y": m["psnr_y"],
-                "final/ssim_y": m["ssim_y"],
-            }
-        )
+        m = trainer.validate_benchmark(dl, name)
+        print(f"  {name:6s} — PSNR: {m['psnr']:.2f}dB | SSIM: {m['ssim']:.4f}")
+        wandb.log({
+            f"benchmark/{name}/psnr": m["psnr"],
+            f"benchmark/{name}/ssim": m["ssim"],
+        })
 
     wandb.finish()
-    print("done.")
+    print("\ndone.")
 
 
 if __name__ == "__main__":
