@@ -288,13 +288,14 @@ class Trainer:
 
             if i < 5:
                 samples.append({
-                    "lr": lr_imgs[0].cpu(),
-                    "sr": pred[0].cpu(),
-                    "hr": hr_imgs[0].cpu(),
+                    "lr": lr_imgs[0].detach().cpu(),
+                    "sr": pred[0].detach().cpu(),
+                    "hr": hr_imgs[0].detach().cpu(),
                     "fname": fname[0],
                 })
 
         n = len(benchmark_dl)
+        torch.cuda.empty_cache()  # VRAM Optimization: prevent memory fragmentation
         return {"psnr": total_psnr / n, "ssim": total_ssim / n, "samples": samples}
 
     # ── main training loop ────────────────

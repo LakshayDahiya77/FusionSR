@@ -84,12 +84,19 @@ class VGGPerceptualLoss(nn.Module):
         pred = (pred - self.mean) / self.std
         target = (target - self.mean) / self.std
 
+        # VRAM Optimization: Extract target features without gradients
+        target_features = []
+        with torch.no_grad():
+            x_target = target
+            for slice_net in self.slices:
+                x_target = slice_net(x_target)
+                target_features.append(x_target.detach())
+
         loss = torch.tensor(0.0, device=pred.device)
-        x_pred, x_target = pred, target
+        x_pred = pred
         for i, slice_net in enumerate(self.slices):
             x_pred = slice_net(x_pred)
-            x_target = slice_net(x_target)
-            loss = loss + self.weights[i] * F.l1_loss(x_pred, x_target.detach())
+            loss = loss + self.weights[i] * F.l1_loss(x_pred, target_features[i])
 
         return loss
 

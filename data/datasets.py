@@ -83,7 +83,7 @@ class DIV2KDatasetFast(Dataset):
 
         for hr_path in hr_files:
             lr_path = Path(lr_dir) / f"{hr_path.stem}x4.png"
-            lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
+            lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.uint8)
             self.lr_images.append(lr)
             self.hr_paths.append(hr_path)
 
@@ -93,12 +93,11 @@ class DIV2KDatasetFast(Dataset):
         return len(self.lr_images)
 
     def __getitem__(self, idx):
-        lr = torch.from_numpy(self.lr_images[idx]).permute(2, 0, 1)
+        lr = torch.from_numpy(self.lr_images[idx]).permute(2, 0, 1).float() / 255.0
         hr = (
-            np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.float32)
-            / 255.0
+            np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.uint8)
         )
-        hr = torch.from_numpy(hr).permute(2, 0, 1)
+        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0
 
         if self.training:
             lr, hr = self._random_crop(lr, hr)
@@ -162,11 +161,11 @@ class SatelliteDataset(Dataset):
         hr_path = self.hr_files[idx]
         lr_path = self.lr_dir / hr_path.name  # same filename in LR dir
 
-        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
-        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
+        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.uint8)
+        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.uint8)
 
-        hr = torch.from_numpy(hr).permute(2, 0, 1)
-        lr = torch.from_numpy(lr).permute(2, 0, 1)
+        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0
+        lr = torch.from_numpy(lr).permute(2, 0, 1).float() / 255.0
 
         if self.training:
             lr, hr = self._random_crop(lr, hr)
@@ -213,11 +212,11 @@ class BenchmarkDataset(Dataset):
         hr_path = self.hr_files[idx]
         lr_path = self.lr_dir / hr_path.name
 
-        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
-        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.float32) / 255.0
+        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.uint8)
+        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.uint8)
 
-        hr = torch.from_numpy(hr).permute(2, 0, 1)
-        lr = torch.from_numpy(lr).permute(2, 0, 1)
+        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0
+        lr = torch.from_numpy(lr).permute(2, 0, 1).float() / 255.0
 
         return lr, hr, hr_path.name
 
@@ -349,10 +348,9 @@ class DIORDataset(Dataset):
     def __getitem__(self, idx):
         # load from RAM disk — fast, JPEG decode on CPU worker
         hr = (
-            np.array(Image.open(self.hr_files[idx]).convert("RGB"), dtype=np.float32)
-            / 255.0
+            np.array(Image.open(self.hr_files[idx]).convert("RGB"), dtype=np.uint8)
         )
-        hr = torch.from_numpy(hr).permute(2, 0, 1)  # [3, 800, 800]
+        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0  # [3, 800, 800]
 
         if self.training:
             # crop on CPU — only 256×256 patch crosses PCIe bus
