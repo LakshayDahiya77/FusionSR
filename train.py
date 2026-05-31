@@ -78,6 +78,7 @@ CONFIG = {
     "use_degradation": False,   # Real-ESRGAN degradation pipeline
 
     # ── data paths (Kaggle) ──
+    "use_ramdisk": False,       # copy datasets to /dev/shm (consumes ~20GB RAM for Flickr2K)
     "div2k_base": "/kaggle/input/datasets/takihasan/div2k-dataset-for-super-resolution/Dataset",
     "flickr_base": "/kaggle/input/datasets/hliang001/flickr2k/Flickr2K",
     "use_flickr": True,         # DIV2K + Flickr2K
@@ -130,27 +131,41 @@ def main():
 
     if CONFIG["use_flickr"]:
         flickr_base = CONFIG["flickr_base"]
-        dst = setup_ramdisk({
-            "flickr_hr": f"{flickr_base}/Flickr2K_HR",
-            "flickr_lr": f"{flickr_base}/Flickr2K_LR_bicubic/X4",
-        })
+        if CONFIG["use_ramdisk"]:
+            dst = setup_ramdisk({
+                "flickr_hr": f"{flickr_base}/Flickr2K_HR",
+                "flickr_lr": f"{flickr_base}/Flickr2K_LR_bicubic/X4",
+            })
+            flickr_hr_path = dst["flickr_hr"]
+            flickr_lr_path = dst["flickr_lr"]
+        else:
+            flickr_hr_path = f"{flickr_base}/Flickr2K_HR"
+            flickr_lr_path = f"{flickr_base}/Flickr2K_LR_bicubic/X4"
+            
         train_dl = make_combined_dataloader(
             div2k_hr=f"{div2k_base}/DIV2K_train_HR",
             div2k_lr=f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
-            flickr_hr=dst["flickr_hr"],
-            flickr_lr=dst["flickr_lr"],
+            flickr_hr=flickr_hr_path,
+            flickr_lr=flickr_lr_path,
             patch_lr=CONFIG["patch_lr"],
             batch_size=CONFIG["batch_size"],
             num_workers=CONFIG["num_workers"],
         )
     else:
-        dst = setup_ramdisk({
-            "train_hr": f"{div2k_base}/DIV2K_train_HR",
-            "train_lr": f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
-        })
+        if CONFIG["use_ramdisk"]:
+            dst = setup_ramdisk({
+                "train_hr": f"{div2k_base}/DIV2K_train_HR",
+                "train_lr": f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
+            })
+            train_hr_path = dst["train_hr"]
+            train_lr_path = dst["train_lr"]
+        else:
+            train_hr_path = f"{div2k_base}/DIV2K_train_HR"
+            train_lr_path = f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4"
+            
         train_dl = make_train_dataloader(
-            train_hr=dst["train_hr"],
-            train_lr=dst["train_lr"],
+            train_hr=train_hr_path,
+            train_lr=train_lr_path,
             patch_lr=CONFIG["patch_lr"],
             batch_size=CONFIG["batch_size"],
             num_workers=CONFIG["num_workers"],
