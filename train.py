@@ -106,7 +106,7 @@ def main():
         n_gpu = torch.cuda.device_count()
         for i in range(n_gpu):
             props = torch.cuda.get_device_properties(i)
-            print(f"GPU {i}: {props.name} ({props.total_mem / 1024**3:.1f}GB)")
+            print(f"GPU {i}: {props.name} ({props.total_memory / 1024**3:.1f}GB)")
     else:
         n_gpu = 0
 
