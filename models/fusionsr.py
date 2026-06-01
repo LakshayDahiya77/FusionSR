@@ -1,25 +1,25 @@
 """
-FusionSR-v3 — Hybrid CNN-Transformer for 4× Super-Resolution.
+FusionSR-v4 — Hybrid CNN-Transformer for 4× Super-Resolution.
 
-Architecture (~8.6M params):
+Architecture (~25M params):
 
     Stage 1 — Shallow Extractor:
-        Single Conv2d(3→96, 3×3). Replaces v2's dual-path extractor
-        whose secondary path (Path B) contributed only 12% weight.
+        Single Conv2d(3→180, 3×3).
 
     Stage 2 — Deep Feature Extraction (6 residual groups):
-        Each group: RCAB×6 → ChannelAttentionBridge → SwinBlockPair(GDFN) → Conv → skip
+        Each group: RCAB×6 → ChannelAttentionBridge → SwinBlockPair(GDFN)
+                    → OverlappingCrossAttention → Conv → skip
         Long skip over entire body.
 
     Stage 3 — Progressive Reconstruction:
-        Two-stage PixelShuffle (2×→2× = 4×) instead of v2's single 4× step.
+        Two-stage PixelShuffle (2×→2× = 4×) instead of single 4× step.
         Conv → PS(2) → GELU → Conv → PS(2) → Conv → GELU → Conv(→RGB)
 
-Changes from v2:
-    - Simplified shallow extractor (single conv vs dual-path)
-    - GDFN replaces Linear FFN in Swin blocks
-    - ChannelAttentionBridge between RCAB and Swin stages
-    - Progressive 2×+2× reconstruction
+Changes from v3:
+    - Default channels: 96 → 180
+    - Default window_size: 8 → 16
+    - Default num_heads: 4 → 6 (head_dim = 30)
+    - Added OCA (Overlapping Cross-Attention) in each ResidualGroup
 """
 
 import torch
@@ -28,33 +28,34 @@ from models.blocks import ResidualGroup
 
 
 class FusionSR(nn.Module):
-    """FusionSR-v3 generator network."""
+    """FusionSR-v4 generator network."""
 
     def __init__(
         self,
         in_channels: int = 3,
         out_channels: int = 3,
-        channels: int = 96,
+        channels: int = 180,
         num_groups: int = 6,
         num_rcab: int = 6,
-        window_size: int = 8,
-        num_heads: int = 4,
+        window_size: int = 16,
+        num_heads: int = 6,
         scale: int = 4,
         ffn_expansion: float = 2.0,
+        oca_overlap: int = 4,
     ):
         super().__init__()
         self.scale = scale
         self.window_size = window_size
 
         # ── Stage 1 — shallow feature extraction ──
-        # single conv replaces v2's dual-path (Path A dominated at 88%)
         self.shallow = nn.Conv2d(in_channels, channels, 3, padding=1, bias=True)
 
         # ── Stage 2 — deep feature extraction ──
         self.body = nn.Sequential(
             *[
                 ResidualGroup(
-                    channels, window_size, num_heads, num_rcab, ffn_expansion
+                    channels, window_size, num_heads, num_rcab,
+                    ffn_expansion, oca_overlap,
                 )
                 for _ in range(num_groups)
             ]
@@ -62,7 +63,6 @@ class FusionSR(nn.Module):
         self.body_conv = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
 
         # ── Stage 3 — progressive reconstruction (2× + 2× = 4×) ──
-        # two-stage PixelShuffle avoids v2's hard 4× mapping
         self.reconstruction = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=True),
             # first 2× upscale

@@ -1,40 +1,32 @@
+"""
+FusionSR-v4 datasets.
+
+Simplified for single-GPU Colab training:
+    - No DDP / DistributedSampler
+    - No RAM disk setup
+    - User-configurable paths via CONFIG
+
+Datasets:
+    PairedSRDataset  — pre-computed LR+HR pairs (DIV2K, Flickr2K)
+    HROnlyDataset    — HR-only, generates LR on-the-fly (LSDIR)
+    BenchmarkDataset — Set5/Set14 evaluation
+"""
+
 import os
-import shutil
 import random
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from PIL import Image
 
 
 # ─────────────────────────────────────────
-#  RAM Disk Setup
+#  GPU Augmentation (geometric only)
 # ─────────────────────────────────────────
-def setup_ramdisk(src_dirs: dict, ramdisk: str = "/dev/shm/fusionsr") -> dict:
-    os.makedirs(ramdisk, exist_ok=True)
-    dst_dirs = {}
-    for name, src in src_dirs.items():
-        dst = os.path.join(ramdisk, name)
-        if os.path.exists(dst):
-            print(f"{name}: already in RAM disk")
-            dst_dirs[name] = dst
-            continue
-        print(f"copying {name}...", end=" ", flush=True)
-        shutil.copytree(src, dst)
-        print(f"done ({len(os.listdir(dst))} files)")
-        dst_dirs[name] = dst
-    stat = shutil.disk_usage("/dev/shm")
-    print(f"RAM disk: {stat.used/1024**3:.2f}GB / {stat.total/1024**3:.2f}GB")
-    return dst_dirs
 
-
-# ─────────────────────────────────────────
-#  GPU Augmentation
-# ─────────────────────────────────────────
 def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
     """
     Random flip and rotation on GPU tensors.
@@ -58,22 +50,19 @@ def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
 
 
 # ─────────────────────────────────────────
-#  Fast Dataset — pre-loads LR into RAM, HR lazily
+#  Paired SR Dataset (DIV2K / Flickr2K)
 # ─────────────────────────────────────────
-class DIV2KDatasetFast(Dataset):
+
+class PairedSRDataset(Dataset):
     """
-    Pre-loads all LR images into RAM.
-    HR images loaded lazily from hr_dir (RAM disk or SSD).
-    Works for both DIV2K and Flickr2K — same filename convention.
-    HR: 000001.png  LR: 000001x4.png
+    Pre-loads all LR images into RAM for speed. HR loaded lazily.
+    Works for DIV2K and Flickr2K — expects matching filenames.
+    HR: 0001.png  LR: 0001x4.png
     """
 
-    def __init__(
-        self, hr_dir: str, lr_dir: str, patch_lr: int = 64, training: bool = True
-    ):
+    def __init__(self, hr_dir: str, lr_dir: str, patch_lr: int = 128):
         super().__init__()
         self.patch_lr = patch_lr
-        self.training = training
 
         hr_files = sorted(Path(hr_dir).glob("*.png"))
         assert len(hr_files) > 0, f"No PNG files in {hr_dir}"
@@ -84,6 +73,9 @@ class DIV2KDatasetFast(Dataset):
 
         for hr_path in hr_files:
             lr_path = Path(lr_dir) / f"{hr_path.stem}x4.png"
+            if not lr_path.exists():
+                # fallback: same filename (some datasets don't add x4 suffix)
+                lr_path = Path(lr_dir) / hr_path.name
             lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.uint8)
             self.lr_images.append(lr)
             self.hr_paths.append(hr_path)
@@ -94,18 +86,16 @@ class DIV2KDatasetFast(Dataset):
         return len(self.lr_images)
 
     def __getitem__(self, idx):
-        lr_np = self.lr_images[idx]          # [H, W, 3] uint8 in RAM
+        lr_np = self.lr_images[idx]
         hr_np = np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.uint8)
-
-        if self.training:
-            lr_np, hr_np = self._random_crop(lr_np, hr_np)
+        lr_np, hr_np = self._random_crop(lr_np, hr_np)
 
         lr = torch.from_numpy(lr_np.copy()).permute(2, 0, 1).float().div_(255.0)
         hr = torch.from_numpy(hr_np.copy()).permute(2, 0, 1).float().div_(255.0)
         return lr, hr
 
     def _random_crop(self, lr: np.ndarray, hr: np.ndarray):
-        """Random crop on uint8 numpy arrays [H, W, 3]. Avoids full-image float32."""
+        """Random crop on uint8 numpy arrays [H, W, 3]."""
         h, w = lr.shape[:2]
         p = self.patch_lr
 
@@ -123,76 +113,81 @@ class DIV2KDatasetFast(Dataset):
 
 
 # ─────────────────────────────────────────
-#  Satellite Dataset — for PROBA-V / WorldStrat
+#  HR-Only Dataset (LSDIR, or any HR folder)
 # ─────────────────────────────────────────
-class SatelliteDataset(Dataset):
+
+class HROnlyDataset(Dataset):
     """
-    Dataset for satellite image SR fine-tuning.
-    Expects paired LR/HR satellite images.
-    HR and LR in separate directories, matched by filename.
-
-    PROBA-V structure:
-        hr_dir/: 0001.png, 0002.png ...  (100m resolution)
-        lr_dir/: 0001.png, 0002.png ...  (300m resolution, 3x downscaled)
-
-    Set training=False for validation (returns full images).
+    For datasets with only HR images (e.g., LSDIR).
+    LR generated on-the-fly via bicubic downscale.
+    Scans recursively for jpg/png/jpeg files.
     """
 
-    def __init__(
-        self,
-        hr_dir: str,
-        lr_dir: str,
-        patch_lr: int = 64,
-        training: bool = True,
-    ):
+    IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
+
+    def __init__(self, hr_dirs: list, patch_lr: int = 128, scale: int = 4):
         super().__init__()
         self.patch_lr = patch_lr
-        self.training = training
+        self.patch_hr = patch_lr * scale
+        self.scale = scale
 
-        self.hr_files = sorted(Path(hr_dir).glob("*.png"))
-        self.lr_dir = Path(lr_dir)
-        assert len(self.hr_files) > 0, f"No PNG files in {hr_dir}"
+        self.hr_files = []
+        for d in hr_dirs:
+            files = sorted(
+                p for p in Path(d).rglob("*")
+                if p.suffix.lower() in self.IMG_EXTENSIONS
+            )
+            self.hr_files.extend(files)
 
-        print(f"satellite dataset: {len(self.hr_files)} image pairs from {hr_dir}")
+        assert len(self.hr_files) > 0, f"No images found in {hr_dirs}"
+        print(f"HROnlyDataset: {len(self.hr_files)} images indexed")
 
     def __len__(self):
         return len(self.hr_files)
 
     def __getitem__(self, idx):
-        hr_path = self.hr_files[idx]
-        lr_path = self.lr_dir / hr_path.name  # same filename in LR dir
+        hr_np = np.array(
+            Image.open(self.hr_files[idx]).convert("RGB"), dtype=np.uint8
+        )
 
-        hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.uint8)
-        lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.uint8)
+        # random crop at HR resolution
+        hr_np = self._random_crop_hr(hr_np)
 
-        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0
-        lr = torch.from_numpy(lr).permute(2, 0, 1).float() / 255.0
+        hr = torch.from_numpy(hr_np.copy()).permute(2, 0, 1).float().div_(255.0)
 
-        if self.training:
-            lr, hr = self._random_crop(lr, hr)
+        # generate LR via bicubic downscale
+        lr = F.interpolate(
+            hr.unsqueeze(0),
+            scale_factor=1.0 / self.scale,
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0).clamp(0, 1)
 
         return lr, hr
 
-    def _random_crop(self, lr: torch.Tensor, hr: torch.Tensor):
-        _, h, w = lr.shape
-        p = self.patch_lr
+    def _random_crop_hr(self, hr: np.ndarray) -> np.ndarray:
+        """Random crop at HR resolution [H, W, 3]."""
+        h, w = hr.shape[:2]
+        p = self.patch_hr
 
         if h < p or w < p:
-            lr = F.pad(lr, (0, max(0, p - w), 0, max(0, p - h)))
-            hr = F.pad(hr, (0, max(0, p - w) * 4, 0, max(0, p - h) * 4))
-            _, h, w = lr.shape
+            hr = np.pad(
+                hr,
+                ((0, max(0, p - h)), (0, max(0, p - w)), (0, 0)),
+                mode='reflect',
+            )
+            h, w = hr.shape[:2]
 
-        x = torch.randint(0, w - p + 1, (1,)).item()
-        y = torch.randint(0, h - p + 1, (1,)).item()
-
-        lr = lr[:, y : y + p, x : x + p]
-        hr = hr[:, y * 4 : y * 4 + p * 4, x * 4 : x * 4 + p * 4]
-        return lr, hr
+        x = random.randint(0, w - p)
+        y = random.randint(0, h - p)
+        return hr[y:y + p, x:x + p]
 
 
 # ─────────────────────────────────────────
-#  Benchmark Dataset — Set5, Set14
+#  Benchmark Dataset (Set5, Set14)
 # ─────────────────────────────────────────
+
 class BenchmarkDataset(Dataset):
     """
     Standard SR benchmark datasets (Set5, Set14).
@@ -223,224 +218,54 @@ class BenchmarkDataset(Dataset):
 
 
 # ─────────────────────────────────────────
-#  Dataloader factories
+#  Dataloader Factories
 # ─────────────────────────────────────────
-def make_train_dataloader(
-    train_hr: str,
-    train_lr: str,
-    patch_lr: int = 64,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    distributed: bool = False,
-) -> DataLoader:
-    """DIV2K only training dataloader."""
-    ds = DIV2KDatasetFast(train_hr, train_lr, patch_lr=patch_lr, training=True)
-    sampler = DistributedSampler(ds, shuffle=True) if distributed else None
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=(sampler is None),
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
 
-
-def make_combined_dataloader(
-    div2k_hr: str,
-    div2k_lr: str,
-    flickr_hr: str,
-    flickr_lr: str,
-    patch_lr: int = 64,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    distributed: bool = False,
-) -> DataLoader:
-    """
-    Combined DIV2K + Flickr2K training dataloader.
-    DIV2K: 800 images, Flickr2K: 2650 images → 3450 total.
-    """
-    div2k_ds = DIV2KDatasetFast(div2k_hr, div2k_lr, patch_lr=patch_lr, training=True)
-    flickr_ds = DIV2KDatasetFast(flickr_hr, flickr_lr, patch_lr=patch_lr, training=True)
-    combined = ConcatDataset([div2k_ds, flickr_ds])
-
-    print(
-        f"combined dataset: {len(combined)} images "
-        f"({len(div2k_ds)} DIV2K + {len(flickr_ds)} Flickr2K)"
-    )
-
-    sampler = DistributedSampler(combined, shuffle=True) if distributed else None
-    return DataLoader(
-        combined,
-        batch_size=batch_size,
-        shuffle=(sampler is None),
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
-
-
-def make_satellite_dataloader(
-    train_hr: str,
-    train_lr: str,
-    patch_lr: int = 64,
+def make_train_dl(
+    hr_dirs: list,
+    lr_dirs: list = None,
+    patch_lr: int = 128,
     batch_size: int = 16,
     num_workers: int = 4,
-    distributed: bool = False,
+    scale: int = 4,
 ) -> DataLoader:
-    """Satellite image training dataloader (PROBA-V / WorldStrat)."""
-    ds = SatelliteDataset(train_hr, train_lr, patch_lr=patch_lr, training=True)
-    sampler = DistributedSampler(ds, shuffle=True) if distributed else None
+    """Create training dataloader.
+
+    If lr_dirs provided: load pre-computed LR-HR pairs (DIV2K/Flickr2K).
+    If lr_dirs is None or empty: HR-only mode, generate LR on-the-fly (LSDIR).
+    """
+    if lr_dirs:
+        # paired LR-HR datasets
+        datasets = []
+        for hr_dir, lr_dir in zip(hr_dirs, lr_dirs):
+            datasets.append(PairedSRDataset(hr_dir, lr_dir, patch_lr=patch_lr))
+
+        if len(datasets) == 1:
+            ds = datasets[0]
+        else:
+            ds = ConcatDataset(datasets)
+            print(f"combined dataset: {len(ds)} images "
+                  f"({' + '.join(str(len(d)) for d in datasets)})")
+    else:
+        # HR-only — LR generated on-the-fly
+        ds = HROnlyDataset(hr_dirs, patch_lr=patch_lr, scale=scale)
+
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=(sampler is None),
-        sampler=sampler,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=4,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
 
-def make_benchmark_loader(hr_dir: str, lr_dir: str) -> DataLoader:
+def make_benchmark_dl(hr_dir: str, lr_dir: str) -> DataLoader:
     """Set5 / Set14 benchmark dataloader."""
     ds = BenchmarkDataset(hr_dir, lr_dir)
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
-
-
-def make_satellite_val_loader(hr_dir: str, lr_dir: str) -> DataLoader:
-    """Satellite validation dataloader — full images, no cropping."""
-    ds = SatelliteDataset(hr_dir, lr_dir, training=False)
-    return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
-
-
-class DIORDataset(Dataset):
-    """
-    Dataset for DIOR satellite imagery SR fine-tuning.
-
-    Pipeline:
-        CPU: index paths → lazy load from RAM disk → random crop 256×256 HR patch
-        GPU: bicubic downscale to 64×64 LR + augmentation (done in trainer)
-
-    Only the small 256×256 crop crosses the PCIe bus, not the full 800×800 image.
-    """
-
-    def __init__(
-        self,
-        hr_dir: str,
-        patch_hr: int = 256,
-        training: bool = True,
-        extensions: tuple = (".jpg", ".png", ".jpeg"),
-        max_images: int = None,
-    ):
-        super().__init__()
-        self.patch_hr = patch_hr
-        self.training = training
-
-        self.hr_files = sorted(
-            [p for p in Path(hr_dir).rglob("*") if p.suffix.lower() in extensions]
-        )
-        assert len(self.hr_files) > 0, f"No images found in {hr_dir}"
-
-        if max_images:
-            self.hr_files = self.hr_files[:max_images]
-
-        print(f"DIORDataset: {len(self.hr_files)} images indexed from {hr_dir}")
-
-    def __len__(self):
-        return len(self.hr_files)
-
-    def __getitem__(self, idx):
-        # load from RAM disk — fast, JPEG decode on CPU worker
-        hr = (
-            np.array(Image.open(self.hr_files[idx]).convert("RGB"), dtype=np.uint8)
-        )
-        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0  # [3, 800, 800]
-
-        if self.training:
-            # crop on CPU — only 256×256 patch crosses PCIe bus
-            hr = self._random_crop(hr)
-        else:
-            # validation — use center crop for deterministic eval
-            hr = self._center_crop(hr)
-
-        return hr  # [3, 256, 256] — LR generated on GPU in trainer
-
-    def _random_crop(self, hr: torch.Tensor) -> torch.Tensor:
-        _, h, w = hr.shape
-        p = self.patch_hr
-        x = torch.randint(0, w - p + 1, (1,)).item()
-        y = torch.randint(0, h - p + 1, (1,)).item()
-        return hr[:, y : y + p, x : x + p]
-
-    def _center_crop(self, hr: torch.Tensor) -> torch.Tensor:
-        _, h, w = hr.shape
-        p = self.patch_hr
-        y = (h - p) // 2
-        x = (w - p) // 2
-        return hr[:, y : y + p, x : x + p]
-
-
-def make_dior_dataloader(
-    hr_dir: str,
-    patch_hr: int = 256,
-    batch_size: int = 16,
-    num_workers: int = 4,
-    training: bool = True,
-    max_images: int = None,
-) -> DataLoader:
-    ds = DIORDataset(
-        hr_dir=hr_dir,
-        patch_hr=patch_hr,
-        training=training,
-        max_images=max_images,
-    )
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=training,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=training,
-        persistent_workers=num_workers > 0,
-    )
-
-
-def make_satellite_hr_dataloader(
-    hr_dir: str,
-    patch_hr: int = 256,
-    scale: int = 4,  # kept for API compatibility, used by GPU LR generation
-    batch_size: int = 16,
-    num_workers: int = 4,
-    training: bool = True,
-) -> DataLoader:
-    """
-    Dataloader for satellite HR-only datasets.
-    LR generated on GPU in training loop via generate_lr_on_gpu().
-    """
-    ds = SatelliteHRDataset(
-        hr_dir=hr_dir,
-        patch_hr=patch_hr,
-        training=training,
-        # scale NOT passed — LR generated on GPU, not in dataset
-    )
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=training,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=training,
-        persistent_workers=True if num_workers > 0 else False,
-    )
 
 
 def generate_lr_on_gpu(hr: torch.Tensor, scale: int = 4) -> torch.Tensor:

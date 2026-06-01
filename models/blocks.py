@@ -1,5 +1,5 @@
 """
-FusionSR-v3 building blocks.
+FusionSR-v4 building blocks.
 
 Components (from literature):
     ChannelAttention       — squeeze-excite from RCAN (Zhang et al., 2018)
@@ -7,17 +7,16 @@ Components (from literature):
     GDFN                   — gated-dconv FFN from Restormer (Zamir et al., 2022)
     ChannelAttentionBridge — cross-window bridge inspired by HAT (Chen et al., 2023)
     WindowAttention        — window multi-head self-attention (SwinIR, Liang et al., 2021)
-    SwinBlock              — W-MSA / SW-MSA + GDFN (v3 upgrade)
+    SwinBlock              — W-MSA / SW-MSA + GDFN
     SwinBlockPair          — W-MSA then SW-MSA with precomputed shift mask
-    ResidualGroup          — RCAB×N → CAB → SwinBlockPair → Conv → skip
+    OverlappingCrossAttention — OCA from HAT (Chen et al., 2023)        [NEW in v4]
+    ResidualGroup          — RCAB×N → CAB → SwinBlockPair → OCA → Conv → skip
 
-Changes from v2:
-    - Standard MLP FFN replaced with GDFN in SwinBlock
-    - ChannelAttentionBridge inserted between RCAB and Swin stages
-    - DualPathExtractor removed (replaced by single conv in fusionsr.py)
+Changes from v3:
+    - Added OverlappingCrossAttention (HAT-style OCA) for cross-window context
+    - ResidualGroup now includes OCA after SwinBlockPair
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,7 +106,6 @@ class GDFN(nn.Module):
         3. Split into two halves — one gates the other via GELU
         4. 1×1 conv projects back to original channels
 
-    This addresses v2's limitation of spatial-unaware FFN in Swin blocks.
     Operates in [B, C, H, W] format (Conv2d-based).
     """
 
@@ -142,10 +140,6 @@ class ChannelAttentionBridge(nn.Module):
     (windowed transformer attention). The global average pooling aggregates
     information across ALL spatial positions, enabling cross-window
     information flow before the windowed self-attention stage.
-
-    This bridges the gap: RCAB produces local features confined to conv
-    receptive fields → CAB creates a globally-informed representation →
-    Swin blocks attend within windows but start from globally-aware features.
     """
 
     def __init__(self, channels: int, reduction: int = 16):
@@ -249,14 +243,11 @@ class WindowAttention(nn.Module):
 
 class SwinBlock(nn.Module):
     """
-    Swin Transformer block with GDFN (v3 upgrade).
+    Swin Transformer block with GDFN.
 
     Attention branch: LayerNorm → [shift] → window partition → attention →
                       window reverse → [unshift] → skip
     FFN branch:       ChannelLayerNorm → GDFN → skip
-
-    Key change from v2: standard Linear→GELU→Linear FFN replaced with GDFN
-    for local spatial awareness in the feed-forward path.
 
     Attention operates in [B, H, W, C]; GDFN operates in [B, C, H, W].
     """
@@ -387,23 +378,138 @@ class SwinBlockPair(nn.Module):
 
 
 # ─────────────────────────────────────────
+#  Overlapping Cross-Attention (HAT-style)
+# ─────────────────────────────────────────
+
+class OverlappingCrossAttention(nn.Module):
+    """
+    HAT-style Overlapping Cross-Attention (OCA).
+
+    Standard window attention confines each query to its own window.
+    OCA extends the key/value context by extracting larger, overlapping
+    windows — each query can attend to neighboring pixels beyond its
+    window boundary.
+
+    Implementation:
+        Q: standard window partition (ws × ws tokens)
+        K, V: overlapping window partition ((ws + 2*overlap)² tokens)
+        Cross-attention: Q attends to K/V from the larger context
+
+    This enables cross-window information flow without the shifted-window
+    mechanism, complementing the W-MSA/SW-MSA pair in SwinBlockPair.
+
+    Reference: HAT (Chen et al., 2023) — Activating More Pixels in
+    Image Super-Resolution Transformer.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        window_size: int,
+        num_heads: int,
+        overlap: int = 4,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.window_size = window_size
+        self.overlap = overlap
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.norm = nn.LayerNorm(channels)
+        self.q_proj = nn.Linear(channels, channels, bias=True)
+        self.kv_proj = nn.Linear(channels, channels * 2, bias=True)
+        self.out_proj = nn.Linear(channels, channels, bias=True)
+
+    def _overlapping_partition(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract overlapping windows for K/V.
+
+        Args:
+            x: [B, H, W, C] input features (H, W must be divisible by window_size)
+
+        Returns:
+            windows: [B*nW, ow*ow, C] where ow = window_size + 2*overlap
+        """
+        B, H, W, C = x.shape
+        ws = self.window_size
+        ov = self.overlap
+        ow = ws + 2 * ov  # overlapping window size
+
+        # reflect-pad so each standard window can grab `overlap` extra pixels
+        # x: [B, H, W, C] → [B, C, H, W] for F.pad → back to [B, H+2ov, W+2ov, C]
+        x_pad = F.pad(
+            x.permute(0, 3, 1, 2),
+            [ov, ov, ov, ov],
+            mode="reflect",
+        ).permute(0, 2, 3, 1)  # [B, H+2ov, W+2ov, C]
+
+        # extract overlapping windows using unfold
+        # unfold along H: stride=ws, size=ow → [B, nH, W+2ov, C, ow]
+        x_pad = x_pad.permute(0, 3, 1, 2)  # [B, C, H+2ov, W+2ov]
+        x_pad = x_pad.unfold(2, ow, ws)     # [B, C, nH, W+2ov, ow]
+        x_pad = x_pad.unfold(3, ow, ws)     # [B, C, nH, nW, ow, ow]
+
+        nH = H // ws
+        nW = W // ws
+        # reshape to [B*nH*nW, ow*ow, C]
+        x_pad = x_pad.permute(0, 2, 3, 4, 5, 1)       # [B, nH, nW, ow, ow, C]
+        x_pad = x_pad.reshape(B * nH * nW, ow * ow, C)
+        return x_pad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        ws = self.window_size
+        shortcut = x
+
+        # work in BHWC for attention
+        x_bhwc = x.permute(0, 2, 3, 1)  # [B, H, W, C]
+        x_bhwc = self.norm(x_bhwc)
+
+        # Q from standard windows
+        q_win = window_partition(x_bhwc, ws)  # [B*nW, ws, ws, C]
+        q_win = q_win.reshape(-1, ws * ws, C)
+        q = self.q_proj(q_win)  # [B*nW, ws², C]
+
+        # K, V from overlapping windows
+        kv_win = self._overlapping_partition(x_bhwc)  # [B*nW, ow², C]
+        kv = self.kv_proj(kv_win)  # [B*nW, ow², 2C]
+        k, v = kv.chunk(2, dim=-1)
+
+        # reshape for multi-head attention
+        num_win = q.shape[0]
+        q = q.reshape(num_win, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(num_win, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(num_win, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # fused scaled dot-product attention
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        out = out.transpose(1, 2).reshape(num_win, ws * ws, C)
+        out = self.out_proj(out)
+
+        # reverse window partition
+        out = out.reshape(-1, ws, ws, C)
+        out = window_reverse(out, ws, H, W)
+        out = out.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+        return shortcut + out
+
+
+# ─────────────────────────────────────────
 #  Residual Group
 # ─────────────────────────────────────────
 
 class ResidualGroup(nn.Module):
     """
-    Residual group — the repeating unit of Stage 2 (v3).
+    Residual group — the repeating unit of Stage 2 (v4).
 
     Structure:
         RCAB × N                (local features, channel attention)
         ChannelAttentionBridge  (global channel bridge — HAT-inspired)
         SwinBlockPair           (global spatial context, shifted window + GDFN)
+        OCA                     (overlapping cross-attention — HAT)    [NEW in v4]
         Conv 3×3                (feature refinement)
         Group-level skip        (residual learning)
-
-    The CAB between RCAB and Swin enables cross-window information flow:
-    RCAB outputs are locally confined → CAB applies global channel gating →
-    Swin blocks start from globally-informed features.
     """
 
     def __init__(
@@ -413,16 +519,19 @@ class ResidualGroup(nn.Module):
         num_heads: int,
         num_rcab: int = 6,
         ffn_expansion: float = 2.0,
+        oca_overlap: int = 4,
     ):
         super().__init__()
         self.rcab_blocks = nn.Sequential(*[RCAB(channels) for _ in range(num_rcab)])
         self.cab = ChannelAttentionBridge(channels)
         self.swin_pair = SwinBlockPair(channels, window_size, num_heads, ffn_expansion)
+        self.oca = OverlappingCrossAttention(channels, window_size, num_heads, oca_overlap)
         self.conv = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = self.rcab_blocks(x)   # local CNN features
         res = self.cab(res)         # global channel bridge
         res = self.swin_pair(res)   # global spatial attention + GDFN
+        res = self.oca(res)         # overlapping cross-attention
         res = self.conv(res)        # refinement
         return x + res              # group skip
