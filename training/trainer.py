@@ -286,7 +286,9 @@ class Trainer:
     @torch.no_grad()
     def validate_benchmark(self, benchmark_dl, name: str) -> dict:
         """Validate on benchmark dataset (Set5, Set14). Returns psnr, ssim, samples."""
-        self.model.eval()
+        # use raw model — DDP forward hooks would deadlock since only rank 0 validates
+        raw_model = self._unwrap(self.model)
+        raw_model.eval()
         total_psnr = 0.0
         total_ssim = 0.0
         samples = []
@@ -297,7 +299,7 @@ class Trainer:
             hr_imgs = hr_imgs.to(self.device).float()
 
             with torch.autocast("cuda", dtype=self.amp_dtype):
-                pred = self.model(lr_imgs).float().clamp(0, 1)
+                pred = raw_model(lr_imgs).float().clamp(0, 1)
 
             # crop to original HR size (model handles window padding)
             hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
