@@ -142,15 +142,20 @@ class Trainer:
         return total_loss / len(self.train_dl)
 
     # ── checkpoint management ─────────────
+    @staticmethod
+    def _unwrap(model: nn.Module) -> nn.Module:
+        """Unwrap DataParallel and torch.compile to get the raw model."""
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        if hasattr(model, "_orig_mod"):  # torch.compile wrapper
+            model = model._orig_mod
+        return model
+
     def save_checkpoint(self, epoch: int, metrics: dict, tag: str = "latest"):
         path = os.path.join(self.save_dir, f"fusionsr_{tag}.pt")
 
-        # unwrap DataParallel — always save clean state dict
-        model_state = (
-            self.model.module.state_dict()
-            if isinstance(self.model, nn.DataParallel)
-            else self.model.state_dict()
-        )
+        # unwrap DataParallel + torch.compile — always save clean state dict
+        model_state = self._unwrap(self.model).state_dict()
 
         ckpt = {
             "epoch": epoch,
@@ -165,11 +170,7 @@ class Trainer:
 
         # save discriminator state if GAN is active
         if self.discriminator is not None:
-            disc_state = (
-                self.discriminator.module.state_dict()
-                if isinstance(self.discriminator, nn.DataParallel)
-                else self.discriminator.state_dict()
-            )
+            disc_state = self._unwrap(self.discriminator).state_dict()
             ckpt["discriminator"] = disc_state
             ckpt["disc_optimizer"] = self.disc_optimizer.state_dict()
             ckpt["disc_scaler"] = self.disc_scaler.state_dict()
@@ -187,21 +188,15 @@ class Trainer:
     def load_checkpoint(self, path: str, reset_best_psnr: bool = False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
-        # load model weights
-        if isinstance(self.model, nn.DataParallel):
-            self.model.module.load_state_dict(ckpt["model"])
-        else:
-            self.model.load_state_dict(ckpt["model"])
+        # load model weights (unwrap DataParallel + torch.compile)
+        self._unwrap(self.model).load_state_dict(ckpt["model"])
 
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scaler.load_state_dict(ckpt["scaler"])
 
         # load discriminator if present in checkpoint and currently active
         if self.discriminator is not None and "discriminator" in ckpt:
-            if isinstance(self.discriminator, nn.DataParallel):
-                self.discriminator.module.load_state_dict(ckpt["discriminator"])
-            else:
-                self.discriminator.load_state_dict(ckpt["discriminator"])
+            self._unwrap(self.discriminator).load_state_dict(ckpt["discriminator"])
             if "disc_optimizer" in ckpt:
                 self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
             if "disc_scaler" in ckpt:
