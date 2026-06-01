@@ -23,6 +23,7 @@ Changes from v3:
 """
 
 import torch
+import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from models.blocks import ResidualGroup
 
