@@ -11,6 +11,7 @@ Usage (Kaggle notebook cell):
 """
 
 import os
+import sys
 import json
 import tempfile
 import glob
@@ -23,6 +24,23 @@ from models.fusionsr import FusionSR, count_parameters
 from models.losses import CombinedSRLoss
 from training.trainer import Trainer
 from data.datasets import make_train_dl, make_benchmark_dl
+
+
+def _ensure_project_on_path():
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+
+    existing = os.environ.get("PYTHONPATH", "")
+    if existing:
+        paths = existing.split(os.pathsep)
+        if module_dir not in paths:
+            os.environ["PYTHONPATH"] = module_dir + os.pathsep + existing
+    else:
+        os.environ["PYTHONPATH"] = module_dir
+
+
+_ensure_project_on_path()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,10 +221,7 @@ def _train_worker(rank: int, world_size: int, config_file: str):
 
 def main():
     """Main entry point. Launches multiprocessing for available GPUs."""
-    import sys
-    # Ensure the spawned processes can find the 'train' module
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    os.environ["PYTHONPATH"] = current_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
+    _ensure_project_on_path()
 
     world_size = torch.cuda.device_count()
     if world_size < 1:
