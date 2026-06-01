@@ -231,6 +231,7 @@ class Trainer:
             lr_min = self.config["lr_min"]
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr_max
+                pg["initial_lr"] = lr_max  # scheduler reads initial_lr, not lr
 
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self.optimizer,
