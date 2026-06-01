@@ -1,6 +1,11 @@
 """
 FusionSR-v3 training entry point.
 
+Supports:
+    - Single GPU with torch.compile (CUDA graphs)
+    - Multi-GPU with DistributedDataParallel (DDP) + torch.compile
+    - Resume from W&B checkpoints across sessions
+
 Usage (Kaggle notebook Cell 2):
 
     import train
@@ -15,12 +20,15 @@ Usage (Kaggle notebook Cell 2):
     # for resuming:
     # train.CONFIG['resume']       = 'wandb'
     # train.CONFIG['wandb_run_id'] = '<run_id>'
+    # train.CONFIG['reset_best_psnr'] = True  # if switching scheduler
 
     train.main()
 """
 
 import os
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import wandb
 
 from models.fusionsr import FusionSR, count_parameters
@@ -55,10 +63,10 @@ CONFIG = {
     "epochs": 50,               # epochs per session
     "lr_max": 2e-4,             # peak learning rate
     "lr_min": 1e-6,             # minimum learning rate
-    "sgdr_t0": 50,              # cosine period (matches session length)
-    "batch_size": 24,           # per-GPU batch (×2 via DataParallel)
+    "sgdr_t0": 250,             # cosine period — set to total planned epochs (avoids mid-training restart)
+    "batch_size": 24,           # per-GPU batch size
     "patch_lr": 96,             # LR patch size (HR = 384)
-    "num_workers": 4,           # dataloader workers
+    "num_workers": 4,           # dataloader workers per GPU
 
     # ── optimizer (AdamW) ──
     "weight_decay": 0.01,
@@ -78,7 +86,7 @@ CONFIG = {
     "use_degradation": False,   # Real-ESRGAN degradation pipeline
 
     # ── data paths (Kaggle) ──
-    "use_ramdisk": False,       # copy datasets to /dev/shm (consumes ~20GB RAM for Flickr2K)
+    "use_ramdisk": False,       # copy datasets to /dev/shm (consumes ~20GB RAM)
     "div2k_base": "/kaggle/input/datasets/takihasan/div2k-dataset-for-super-resolution/Dataset",
     "flickr_base": "/kaggle/input/datasets/hliang001/flickr2k/Flickr2K",
     "use_flickr": True,         # DIV2K + Flickr2K
@@ -91,6 +99,7 @@ CONFIG = {
 
     # ── resume ──
     "resume": None,             # None | "wandb" | "/path/to/ckpt.pt"
+    "resume_tag": "best",        # "best" or "latest" — which W&B artifact to resume from
     "reset_best_psnr": False,   # reset best PSNR and scheduler on resume
 
     # ── paths ──
@@ -98,33 +107,56 @@ CONFIG = {
 }
 
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\ndevice: {device}")
+def _train_worker(rank: int, world_size: int):
+    """Training worker — called once per GPU process."""
+    is_main = (rank == 0)
+    use_ddp = (world_size > 1)
+
+    # ── DDP process group ──
+    if use_ddp:
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "12355")
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+
+    device = torch.device(f"cuda:{rank}")
+    torch.backends.cudnn.benchmark = True  # auto-tune conv algorithms for fixed patch sizes
+
+    try:
+        _run_training(rank, world_size, device, is_main, use_ddp)
+    finally:
+        if use_ddp:
+            dist.destroy_process_group()
+
+
+def _run_training(rank, world_size, device, is_main, use_ddp):
+    """Core training logic — isolated for clean DDP cleanup."""
 
     # ── GPU info ──
-    if device.type == "cuda":
-        n_gpu = torch.cuda.device_count()
-        for i in range(n_gpu):
+    if is_main:
+        print(f"\ndevice: {device}")
+        n_total = torch.cuda.device_count()
+        for i in range(n_total):
             props = torch.cuda.get_device_properties(i)
             print(f"GPU {i}: {props.name} ({props.total_memory / 1024**3:.1f}GB)")
-    else:
-        n_gpu = 0
+        if use_ddp:
+            print(f"using {world_size} GPUs via DistributedDataParallel + torch.compile")
 
-    # ── W&B ──
-    if CONFIG["resume"] and CONFIG["wandb_run_id"]:
-        run = wandb.init(
-            project=CONFIG["wandb_project"],
-            id=CONFIG["wandb_run_id"],
-            resume="must",
-        )
-    else:
-        run = wandb.init(
-            project=CONFIG["wandb_project"],
-            name=CONFIG["wandb_run"],
-            config=CONFIG,
-        )
-    print(f"W&B run ID: {run.id}\n")
+    # ── W&B (rank 0 only) ──
+    if is_main:
+        if CONFIG["resume"] and CONFIG["wandb_run_id"]:
+            run = wandb.init(
+                project=CONFIG["wandb_project"],
+                id=CONFIG["wandb_run_id"],
+                resume="must",
+            )
+        else:
+            run = wandb.init(
+                project=CONFIG["wandb_project"],
+                name=CONFIG["wandb_run"],
+                config=CONFIG,
+            )
+        print(f"W&B run ID: {run.id}\n")
 
     # ── dataloaders ──
     div2k_base = CONFIG["div2k_base"]
@@ -141,7 +173,7 @@ def main():
         else:
             flickr_hr_path = f"{flickr_base}/Flickr2K_HR"
             flickr_lr_path = f"{flickr_base}/Flickr2K_LR_bicubic/X4"
-            
+
         train_dl = make_combined_dataloader(
             div2k_hr=f"{div2k_base}/DIV2K_train_HR",
             div2k_lr=f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4",
@@ -150,6 +182,7 @@ def main():
             patch_lr=CONFIG["patch_lr"],
             batch_size=CONFIG["batch_size"],
             num_workers=CONFIG["num_workers"],
+            distributed=use_ddp,
         )
     else:
         if CONFIG["use_ramdisk"]:
@@ -162,13 +195,14 @@ def main():
         else:
             train_hr_path = f"{div2k_base}/DIV2K_train_HR"
             train_lr_path = f"{div2k_base}/DIV2K_train_LR_bicubic_X4/X4"
-            
+
         train_dl = make_train_dataloader(
             train_hr=train_hr_path,
             train_lr=train_lr_path,
             patch_lr=CONFIG["patch_lr"],
             batch_size=CONFIG["batch_size"],
             num_workers=CONFIG["num_workers"],
+            distributed=use_ddp,
         )
 
     bench_base = CONFIG["bench_base"]
@@ -177,7 +211,8 @@ def main():
         lr_dir=f"{bench_base}/Set5/Set5/LRbicx4",
     )
 
-    print(f"train batches: {len(train_dl)} | valid images: {len(valid_dl)}")
+    if is_main:
+        print(f"train batches: {len(train_dl)} | valid images: {len(valid_dl)}")
 
     # ── model ──
     model = FusionSR(
@@ -191,17 +226,15 @@ def main():
         scale=CONFIG["scale"],
         ffn_expansion=CONFIG["ffn_expansion"],
     )
-
-    # DataParallel for T4×2 — batch split across GPUs
-    if n_gpu > 1:
-        print(f"using {n_gpu} GPUs via DataParallel")
-        model = torch.nn.DataParallel(model)
-    else:
-        # torch.compile: fuse ops + CUDA graphs for fixed-size patches
-        # incompatible with DataParallel — only used on single GPU
-        model = torch.compile(model, mode="reduce-overhead")
     model = model.to(device)
-    print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
+
+    # torch.compile + DDP (or compile-only for single GPU)
+    model = torch.compile(model)
+    if use_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+
+    if is_main:
+        print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
     # ── loss ──
     loss_fn = CombinedSRLoss(
@@ -223,21 +256,24 @@ def main():
     disc_optimizer = None
     if CONFIG["use_gan"]:
         from models.discriminator import VGGStyleDiscriminator
-        discriminator = VGGStyleDiscriminator()
-        if n_gpu > 1:
-            discriminator = torch.nn.DataParallel(discriminator)
-        discriminator = discriminator.to(device)
+        discriminator = VGGStyleDiscriminator().to(device)
+        if use_ddp:
+            discriminator = torch.nn.parallel.DistributedDataParallel(
+                discriminator, device_ids=[rank]
+            )
         disc_optimizer = torch.optim.AdamW(
             discriminator.parameters(), lr=1e-4, weight_decay=0.01,
         )
-        print(f"discriminator: {count_parameters(discriminator) / 1e6:.2f}M")
+        if is_main:
+            print(f"discriminator: {count_parameters(discriminator) / 1e6:.2f}M")
 
     # ── optional: degradation pipeline ──
     degradation_fn = None
     if CONFIG["use_degradation"]:
         from data.degradation import RealESRGANDegradation
         degradation_fn = RealESRGANDegradation(scale=CONFIG["scale"]).to(device)
-        print("real-world degradation pipeline: enabled")
+        if is_main:
+            print("real-world degradation pipeline: enabled")
 
     # ── trainer ──
     trainer = Trainer(
@@ -252,14 +288,31 @@ def main():
         discriminator=discriminator,
         disc_optimizer=disc_optimizer,
         degradation_fn=degradation_fn,
+        rank=rank,
     )
 
     # ── resume ──
-    if CONFIG["resume"] == "wandb":
-        ckpt_path = Trainer.download_checkpoint(CONFIG["wandb_project"])
+    if CONFIG["resume"]:
+        if CONFIG["resume"] == "wandb":
+            if is_main:
+                ckpt_path = Trainer.download_checkpoint(
+                    CONFIG["wandb_project"], tag=CONFIG["resume_tag"]
+                )
+            else:
+                ckpt_path = ""
+
+            # broadcast checkpoint path from rank 0 to all ranks
+            if use_ddp:
+                path_list = [ckpt_path]
+                dist.broadcast_object_list(path_list, src=0)
+                ckpt_path = path_list[0]
+        else:
+            ckpt_path = CONFIG["resume"]
+
         trainer.load_checkpoint(ckpt_path, reset_best_psnr=CONFIG["reset_best_psnr"])
-    elif CONFIG["resume"]:
-        trainer.load_checkpoint(CONFIG["resume"], reset_best_psnr=CONFIG["reset_best_psnr"])
+
+    if use_ddp:
+        dist.barrier()  # sync all ranks before training
 
     # ── train ──
     trainer.fit(
@@ -269,27 +322,38 @@ def main():
         validate_every=CONFIG["validate_every"],
     )
 
-    # ── post-training benchmark ──
-    print("\n" + "=" * 60)
-    print("post-training benchmark evaluation")
-    print("=" * 60)
-    for name, hr_sub, lr_sub in [
-        ("Set5", "Set5/Set5/GTmod12", "Set5/Set5/LRbicx4"),
-        ("Set14", "Set14/Set14/GTmod12", "Set14/Set14/LRbicx4"),
-    ]:
-        dl = make_benchmark_loader(
-            hr_dir=f"{bench_base}/{hr_sub}",
-            lr_dir=f"{bench_base}/{lr_sub}",
-        )
-        m = trainer.validate_benchmark(dl, name)
-        print(f"  {name:6s} — PSNR: {m['psnr']:.2f}dB | SSIM: {m['ssim']:.4f}")
-        wandb.log({
-            f"benchmark/{name}/psnr": m["psnr"],
-            f"benchmark/{name}/ssim": m["ssim"],
-        })
+    # ── post-training benchmark (rank 0 only) ──
+    if is_main:
+        print("\n" + "=" * 60)
+        print("post-training benchmark evaluation")
+        print("=" * 60)
+        for name, hr_sub, lr_sub in [
+            ("Set5", "Set5/Set5/GTmod12", "Set5/Set5/LRbicx4"),
+            ("Set14", "Set14/Set14/GTmod12", "Set14/Set14/LRbicx4"),
+        ]:
+            dl = make_benchmark_loader(
+                hr_dir=f"{bench_base}/{hr_sub}",
+                lr_dir=f"{bench_base}/{lr_sub}",
+            )
+            m = trainer.validate_benchmark(dl, name)
+            print(f"  {name:6s} — PSNR: {m['psnr']:.2f}dB | SSIM: {m['ssim']:.4f}")
+            wandb.log({
+                f"benchmark/{name}/psnr": m["psnr"],
+                f"benchmark/{name}/ssim": m["ssim"],
+            })
 
-    wandb.finish()
-    print("\ndone.")
+        wandb.finish()
+        print("\ndone.")
+
+
+def main():
+    """Entry point — spawns DDP workers for multi-GPU, or runs directly for single GPU."""
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpu > 1:
+        mp.spawn(_train_worker, args=(n_gpu,), nprocs=n_gpu, join=True)
+    else:
+        _train_worker(0, 1)
 
 
 if __name__ == "__main__":

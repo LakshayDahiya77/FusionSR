@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from PIL import Image
 
@@ -230,13 +231,16 @@ def make_train_dataloader(
     patch_lr: int = 64,
     batch_size: int = 32,
     num_workers: int = 4,
+    distributed: bool = False,
 ) -> DataLoader:
     """DIV2K only training dataloader."""
     ds = DIV2KDatasetFast(train_hr, train_lr, patch_lr=patch_lr, training=True)
+    sampler = DistributedSampler(ds, shuffle=True) if distributed else None
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
@@ -253,6 +257,7 @@ def make_combined_dataloader(
     patch_lr: int = 64,
     batch_size: int = 32,
     num_workers: int = 4,
+    distributed: bool = False,
 ) -> DataLoader:
     """
     Combined DIV2K + Flickr2K training dataloader.
@@ -267,10 +272,12 @@ def make_combined_dataloader(
         f"({len(div2k_ds)} DIV2K + {len(flickr_ds)} Flickr2K)"
     )
 
+    sampler = DistributedSampler(combined, shuffle=True) if distributed else None
     return DataLoader(
         combined,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
@@ -285,13 +292,16 @@ def make_satellite_dataloader(
     patch_lr: int = 64,
     batch_size: int = 16,
     num_workers: int = 4,
+    distributed: bool = False,
 ) -> DataLoader:
     """Satellite image training dataloader (PROBA-V / WorldStrat)."""
     ds = SatelliteDataset(train_hr, train_lr, patch_lr=patch_lr, training=True)
+    sampler = DistributedSampler(ds, shuffle=True) if distributed else None
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,

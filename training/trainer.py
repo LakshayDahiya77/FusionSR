@@ -1,21 +1,20 @@
 """
 FusionSR-v3 trainer.
 
-Changes from v2:
-    - AdamW optimizer with weight decay
-    - Gradient clipping (max_norm=1.0 by default)
-    - Linear warm-up for first N epochs (avoids early instability)
-    - CombinedSRLoss returns (loss, loss_dict) for component logging
-    - Optional GAN discriminator update loop
-    - Optional Real-ESRGAN degradation pipeline
-    - SSIM in per-epoch output and W&B logging
-    - Checkpoint saves discriminator state when GAN is active
+Supports:
+    - Single GPU with torch.compile
+    - Multi-GPU with DistributedDataParallel (DDP)
+    - AdamW optimizer with gradient clipping
+    - Linear warm-up + SGDR cosine schedule
+    - Optional GAN discriminator + Real-ESRGAN degradation
+    - W&B logging and checkpoint management (rank 0 only)
 """
 
 import os
 import time
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import wandb
 
 from utils.metrics import psnr, ssim
@@ -23,7 +22,7 @@ from data.datasets import gpu_augment
 
 
 class Trainer:
-    """Training loop with checkpoint management, W&B logging, and optional GAN."""
+    """Training loop with DDP support, checkpoint management, and W&B logging."""
 
     def __init__(
         self,
@@ -38,6 +37,7 @@ class Trainer:
         discriminator: nn.Module = None,
         disc_optimizer: torch.optim.Optimizer = None,
         degradation_fn: nn.Module = None,
+        rank: int = 0,
     ):
         self.model = model
         self.loss_fn = loss_fn
@@ -51,6 +51,9 @@ class Trainer:
         self.disc_optimizer = disc_optimizer
         self.degradation_fn = degradation_fn
 
+        self.rank = rank
+        self.is_main = (rank == 0)
+
         self.scaler = torch.amp.GradScaler("cuda")
         self.grad_clip = config.get("grad_clip", 0.0)
         self.warmup_epochs = config.get("warmup_epochs", 0)
@@ -58,7 +61,7 @@ class Trainer:
         self.best_psnr = 0.0
         self.start_epoch = 0
 
-        # SGDR scheduler — T_0 matches session length for automatic warm restarts
+        # SGDR scheduler — T_0 set to total planned epochs (no mid-training restart)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
             T_0=config["sgdr_t0"],
@@ -82,6 +85,10 @@ class Trainer:
             self.discriminator.train()
         total_loss = 0.0
         is_satellite = self.config.get("mode") == "satellite"
+
+        # DDP: tell sampler which epoch for proper shuffling
+        if hasattr(self.train_dl.sampler, 'set_epoch'):
+            self.train_dl.sampler.set_epoch(epoch)
 
         for batch in self.train_dl:
             if is_satellite:
@@ -144,17 +151,23 @@ class Trainer:
     # ── checkpoint management ─────────────
     @staticmethod
     def _unwrap(model: nn.Module) -> nn.Module:
-        """Unwrap DataParallel and torch.compile to get the raw model."""
-        if isinstance(model, nn.DataParallel):
-            model = model.module
-        if hasattr(model, "_orig_mod"):  # torch.compile wrapper
-            model = model._orig_mod
+        """Unwrap DDP/DataParallel and torch.compile to get the raw model."""
+        for _ in range(3):  # max 3 layers of wrapping
+            if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
+                model = model.module
+            elif hasattr(model, "_orig_mod"):  # torch.compile wrapper
+                model = model._orig_mod
+            else:
+                break
         return model
 
     def save_checkpoint(self, epoch: int, metrics: dict, tag: str = "latest"):
+        if not self.is_main:
+            return
+
         path = os.path.join(self.save_dir, f"fusionsr_{tag}.pt")
 
-        # unwrap DataParallel + torch.compile — always save clean state dict
+        # unwrap DDP + torch.compile — always save clean state dict
         model_state = self._unwrap(self.model).state_dict()
 
         ckpt = {
@@ -188,7 +201,7 @@ class Trainer:
     def load_checkpoint(self, path: str, reset_best_psnr: bool = False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
-        # load model weights (unwrap DataParallel + torch.compile)
+        # load model weights (unwrap DDP + torch.compile)
         self._unwrap(self.model).load_state_dict(ckpt["model"])
 
         self.optimizer.load_state_dict(ckpt["optimizer"])
@@ -217,14 +230,16 @@ class Trainer:
                 T_mult=1,
                 eta_min=lr_min,
             )
-            print(f"scheduler reset | lr_max={lr_max} | lr_min={lr_min}")
+            if self.is_main:
+                print(f"scheduler reset | lr_max={lr_max} | lr_min={lr_min}")
         else:
             if "scheduler" in ckpt:
                 self.scheduler.load_state_dict(ckpt["scheduler"])
             self.best_psnr = ckpt["best_psnr"]
             self.start_epoch = ckpt["epoch"] + 1
 
-        print(f"resumed from epoch {ckpt['epoch']} | best PSNR {self.best_psnr:.2f}dB")
+        if self.is_main:
+            print(f"resumed from epoch {ckpt['epoch']} | best PSNR {self.best_psnr:.2f}dB")
 
     @staticmethod
     def download_checkpoint(project: str, tag: str = "latest") -> str:
@@ -234,6 +249,8 @@ class Trainer:
 
     # ── W&B sample logging ────────────────
     def _log_samples(self, samples: list, epoch: int):
+        if not self.is_main:
+            return
         panels = []
         for s in samples:
             lr_up = (
@@ -290,19 +307,24 @@ class Trainer:
                 })
 
         n = len(benchmark_dl)
-        torch.cuda.empty_cache()  # VRAM Optimization: prevent memory fragmentation
+        torch.cuda.empty_cache()
         return {"psnr": total_psnr / n, "ssim": total_ssim / n, "samples": samples}
 
     # ── main training loop ────────────────
     def fit(self, epochs: int, lr_max: float, lr_min: float, validate_every: int = 1):
-        print(f"starting training for {epochs} epochs")
-        print(f"SGDR T0={self.config['sgdr_t0']} | LR {lr_max} → {lr_min}")
-        if self.warmup_epochs > 0 and self.start_epoch < self.warmup_epochs:
-            print(f"warm-up: {self.warmup_epochs} epochs (linear ramp)")
-        if self.grad_clip > 0:
-            print(f"gradient clipping: max_norm={self.grad_clip}")
-        print(f"validating every {validate_every} epochs")
-        print("-" * 60)
+        use_ddp = dist.is_available() and dist.is_initialized()
+
+        if self.is_main:
+            print(f"starting training for {epochs} epochs")
+            print(f"cosine T0={self.config['sgdr_t0']} | LR {lr_max} → {lr_min}")
+            if self.warmup_epochs > 0 and self.start_epoch < self.warmup_epochs:
+                print(f"warm-up: {self.warmup_epochs} epochs (linear ramp)")
+            if self.grad_clip > 0:
+                print(f"gradient clipping: max_norm={self.grad_clip}")
+            if use_ddp:
+                print(f"DDP: {dist.get_world_size()} GPUs, gradient sync every step")
+            print(f"validating every {validate_every} epochs")
+            print("-" * 60)
 
         for epoch in range(self.start_epoch, self.start_epoch + epochs):
 
@@ -318,7 +340,7 @@ class Trainer:
 
             current_lr = self.optimizer.param_groups[0]["lr"]
 
-            # ── train ──
+            # ── train (all ranks participate, DDP syncs gradients) ──
             t0 = time.time()
             train_loss = self.train_epoch(epoch)
             train_time = time.time() - t0
@@ -330,49 +352,58 @@ class Trainer:
                 "epoch": epoch,
             }
 
-            # ── validate ──
-            if (epoch + 1) % validate_every == 0 or epoch == self.start_epoch:
-                t0 = time.time()
-                metrics = self.validate_benchmark(self.valid_dl, "Set5")
-                val_time = time.time() - t0
+            # ── validate (rank 0 only, others wait at barrier) ──
+            need_val = (epoch + 1) % validate_every == 0 or epoch == self.start_epoch
+            if need_val:
+                if self.is_main:
+                    t0 = time.time()
+                    metrics = self.validate_benchmark(self.valid_dl, "Set5")
+                    val_time = time.time() - t0
 
-                primary_psnr = metrics["psnr"]
-                primary_ssim = metrics["ssim"]
+                    primary_psnr = metrics["psnr"]
+                    primary_ssim = metrics["ssim"]
 
-                val_log = {
-                    "val/psnr": primary_psnr,
-                    "val/ssim": primary_ssim,
-                    "time/val_epoch": val_time,
-                    "time/total_epoch": train_time + val_time,
-                }
-                log_dict.update(val_log)
+                    val_log = {
+                        "val/psnr": primary_psnr,
+                        "val/ssim": primary_ssim,
+                        "time/val_epoch": val_time,
+                        "time/total_epoch": train_time + val_time,
+                    }
+                    log_dict.update(val_log)
 
-                if (epoch + 1) % 10 == 0 and "samples" in metrics:
-                    self._log_samples(metrics["samples"], epoch)
+                    if (epoch + 1) % 10 == 0 and "samples" in metrics:
+                        self._log_samples(metrics["samples"], epoch)
 
-                is_best = primary_psnr > self.best_psnr
-                if is_best:
-                    self.best_psnr = primary_psnr
-                    self.save_checkpoint(epoch, metrics, tag="best")
+                    is_best = primary_psnr > self.best_psnr
+                    if is_best:
+                        self.best_psnr = primary_psnr
+                        self.save_checkpoint(epoch, metrics, tag="best")
 
-                # ── per-epoch output (user-requested format) ──
-                best_marker = " ← best" if is_best else ""
-                print(
-                    f"epoch {epoch:4d} | loss {train_loss:.4f} | "
-                    f"PSNR {primary_psnr:.2f}dB | SSIM {primary_ssim:.4f} | "
-                    f"train {train_time:.0f}s | val {val_time:.0f}s | "
-                    f"LR {current_lr:.2e}{best_marker}"
-                )
+                    # ── per-epoch output (user-requested format) ──
+                    best_marker = " ← best" if is_best else ""
+                    print(
+                        f"epoch {epoch:4d} | loss {train_loss:.4f} | "
+                        f"PSNR {primary_psnr:.2f}dB | SSIM {primary_ssim:.4f} | "
+                        f"train {train_time:.0f}s | val {val_time:.0f}s | "
+                        f"LR {current_lr:.2e}{best_marker}"
+                    )
 
-                self.save_checkpoint(epoch, metrics, tag="latest")
+                    self.save_checkpoint(epoch, metrics, tag="latest")
+
+                # sync ranks after validation + checkpoint save
+                if use_ddp:
+                    dist.barrier()
             else:
-                log_dict["time/total_epoch"] = train_time
-                print(
-                    f"epoch {epoch:4d} | loss {train_loss:.4f} | "
-                    f"train {train_time:.0f}s | LR {current_lr:.2e}"
-                )
+                if self.is_main:
+                    log_dict["time/total_epoch"] = train_time
+                    print(
+                        f"epoch {epoch:4d} | loss {train_loss:.4f} | "
+                        f"train {train_time:.0f}s | LR {current_lr:.2e}"
+                    )
 
-            wandb.log(log_dict, step=epoch)
+            if self.is_main:
+                wandb.log(log_dict, step=epoch)
 
-        print("-" * 60)
-        print(f"training complete. best PSNR: {self.best_psnr:.2f}dB")
+        if self.is_main:
+            print("-" * 60)
+            print(f"training complete. best PSNR: {self.best_psnr:.2f}dB")
