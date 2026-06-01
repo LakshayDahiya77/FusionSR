@@ -248,7 +248,18 @@ class Trainer:
             self.start_epoch = ckpt["epoch"] + 1
 
         if self.is_main:
-            print(f"resumed from epoch {ckpt['epoch']} | best PSNR {self.best_psnr:.2f}dB")
+            # show checkpoint stats so user can verify correct weights
+            m = ckpt.get("metrics", {})
+            ckpt_cfg = ckpt.get("config", {})
+            print(f"── checkpoint loaded ──")
+            print(f"  epoch:    {ckpt['epoch']}")
+            print(f"  PSNR:     {m.get('psnr', 'N/A')}")
+            print(f"  SSIM:     {m.get('ssim', 'N/A')}")
+            print(f"  best PSNR (saved): {ckpt.get('best_psnr', 'N/A')}")
+            print(f"  trained with lr:   {ckpt_cfg.get('lr_max', 'N/A')}")
+            print(f"  trained with T0:   {ckpt_cfg.get('sgdr_t0', 'N/A')}")
+            print(f"── resume config ──")
+            print(f"  start_epoch: {self.start_epoch} | best_psnr: {self.best_psnr:.2f}dB")
 
     @staticmethod
     def download_checkpoint(project: str, tag: str = "latest") -> str:
