@@ -94,6 +94,7 @@ CONFIG = {
     # ── resume ──
     "resume": None,             # None | "wandb" | "/path/to/ckpt.pt"
     "resume_tag": "best",       # "best" or "latest" — which W&B artifact to resume from
+    "resume_version": "latest", # "latest", "v0", "v1" — artifact version (check W&B Artifacts tab)
     "reset_best_psnr": False,   # reset best PSNR and scheduler on resume
 
     # ── paths ──
@@ -299,7 +300,9 @@ def _run_training(rank, world_size, device, is_main, use_ddp, config):
         if config["resume"] == "wandb":
             if is_main:
                 ckpt_path = Trainer.download_checkpoint(
-                    config["wandb_project"], tag=config["resume_tag"]
+                    config["wandb_project"],
+                    tag=config["resume_tag"],
+                    version=config["resume_version"],
                 )
             else:
                 ckpt_path = ""

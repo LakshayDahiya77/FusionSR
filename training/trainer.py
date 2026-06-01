@@ -262,8 +262,16 @@ class Trainer:
             print(f"  start_epoch: {self.start_epoch} | best_psnr: {self.best_psnr:.2f}dB")
 
     @staticmethod
-    def download_checkpoint(project: str, tag: str = "latest") -> str:
-        artifact = wandb.use_artifact(f"fusionsr-{tag}:latest", type="model")
+    def download_checkpoint(project: str, tag: str = "latest", version: str = "latest") -> str:
+        """Download checkpoint from W&B artifacts.
+        
+        Args:
+            tag: 'best' or 'latest' — artifact name
+            version: 'latest', 'v0', 'v1', etc. — artifact version
+        """
+        artifact_ref = f"fusionsr-{tag}:{version}"
+        print(f"downloading artifact: {artifact_ref}")
+        artifact = wandb.use_artifact(artifact_ref, type="model")
         artifact_dir = artifact.download()
         return os.path.join(artifact_dir, f"fusionsr_{tag}.pt")
 
