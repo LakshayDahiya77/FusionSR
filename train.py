@@ -61,6 +61,12 @@ CONFIG = {
     "num_workers": 4,           # dataloader workers
     "weight_decay": 0.01,       # AdamW weight decay
     "grad_clip": 1.0,           # gradient clipping max norm
+    "allow_tf32": True,         # enable TF32 on Ampere+ for faster matmul/conv
+    "matmul_precision": "high", # torch.set_float32_matmul_precision
+    "use_compile": False,       # torch.compile (PyTorch 2.x)
+    "compile_mode": "max-autotune",
+    "compile_fullgraph": False,
+    "compile_dynamic": False,
 
     # ── data paths (set in notebook cell) ──
     "train_hr_dirs": [],        # list of HR image directories
@@ -90,6 +96,14 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     config = CONFIG.copy()
+
+    if config.get("allow_tf32", False):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    matmul_precision = config.get("matmul_precision")
+    if matmul_precision:
+        torch.set_float32_matmul_precision(matmul_precision)
 
     # ── GPU info ──
     print(f"\ndevice: {device}")
@@ -146,6 +160,14 @@ def main():
         ffn_expansion=config["ffn_expansion"],
         oca_overlap=config["oca_overlap"],
     ).to(device)
+
+    if config.get("use_compile", False) and hasattr(torch, "compile"):
+        model = torch.compile(
+            model,
+            mode=config.get("compile_mode", "max-autotune"),
+            fullgraph=config.get("compile_fullgraph", False),
+            dynamic=config.get("compile_dynamic", False),
+        )
 
     print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
