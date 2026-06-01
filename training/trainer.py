@@ -85,11 +85,6 @@ class Trainer:
 
         os.makedirs(save_dir, exist_ok=True)
 
-        # tell W&B to use "epoch" field as x-axis (avoids step conflicts on resume)
-        if self.is_main:
-            wandb.define_metric("epoch")
-            wandb.define_metric("*", step_metric="epoch")
-
     # ── single training epoch ─────────────
     def train_epoch(self, epoch: int) -> float:
         """Run one training epoch. Returns average loss."""
