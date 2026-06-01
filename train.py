@@ -18,6 +18,7 @@ Usage (Kaggle notebook Cell 2):
 """
 
 import os
+import json
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -99,13 +100,18 @@ CONFIG = {
     "save_dir": "/kaggle/working/checkpoints",
 }
 
+_CONFIG_PATH = "/tmp/fusionsr_config.json"
 
-def _train_worker(rank: int, world_size: int, config: dict):
+
+def _train_worker(rank: int, world_size: int):
     """Training worker — called once per GPU process.
     
-    config is passed explicitly from main() so that notebook overrides
-    survive mp.spawn (which re-imports the module with default CONFIG).
+    Reads config from a JSON file written by main(). This avoids the problem
+    where mp.spawn re-imports the module and loses notebook CONFIG overrides.
     """
+    with open(_CONFIG_PATH) as f:
+        config = json.load(f)
+
     is_main = (rank == 0)
     use_ddp = (world_size > 1)
 
@@ -349,12 +355,15 @@ def main():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
-    # Pass CONFIG as argument — mp.spawn re-imports the module,
+    # Save CONFIG to temp file — mp.spawn re-imports the module,
     # so notebook overrides to CONFIG would be lost without this
+    with open(_CONFIG_PATH, "w") as f:
+        json.dump(CONFIG, f)
+
     if n_gpu > 1:
-        mp.spawn(_train_worker, args=(n_gpu, dict(CONFIG)), nprocs=n_gpu, join=True)
+        mp.spawn(_train_worker, args=(n_gpu,), nprocs=n_gpu, join=True)
     else:
-        _train_worker(0, 1, dict(CONFIG))
+        _train_worker(0, 1)
 
 
 if __name__ == "__main__":
