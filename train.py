@@ -203,6 +203,11 @@ def _train_worker(rank: int, world_size: int, config_file: str):
 
 def main():
     """Main entry point. Launches multiprocessing for available GPUs."""
+    import sys
+    # Ensure the spawned processes can find the 'train' module
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    os.environ["PYTHONPATH"] = current_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
+
     world_size = torch.cuda.device_count()
     if world_size < 1:
         raise RuntimeError("No GPUs found. Kaggle requires GPUs for this script.")
