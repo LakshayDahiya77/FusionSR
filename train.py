@@ -143,7 +143,7 @@ def _run_training(rank, world_size, device, is_main, use_ddp, config):
             props = torch.cuda.get_device_properties(i)
             print(f"GPU {i}: {props.name} ({props.total_memory / 1024**3:.1f}GB)")
         if use_ddp:
-            print(f"using {world_size} GPUs via DistributedDataParallel + torch.compile")
+            print(f"using {world_size} GPUs via DistributedDataParallel")
 
     # ── W&B (rank 0 only) ──
     if is_main:
@@ -232,8 +232,7 @@ def _run_training(rank, world_size, device, is_main, use_ddp, config):
     )
     model = model.to(device)
 
-    # torch.compile + DDP (or compile-only for single GPU)
-    model = torch.compile(model)
+    # DDP for multi-GPU (torch.compile skipped — T4 inductor is too slow)
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
