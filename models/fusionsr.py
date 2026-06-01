@@ -23,7 +23,7 @@ Changes from v3:
 """
 
 import torch
-import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from models.blocks import ResidualGroup
 
 
@@ -42,17 +42,20 @@ class FusionSR(nn.Module):
         scale: int = 4,
         ffn_expansion: float = 2.0,
         oca_overlap: int = 4,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.scale = scale
         self.window_size = window_size
+        self.use_checkpoint = use_checkpoint
 
         # ── Stage 1 — shallow feature extraction ──
         self.shallow = nn.Conv2d(in_channels, channels, 3, padding=1, bias=True)
 
         # ── Stage 2 — deep feature extraction ──
-        self.body = nn.Sequential(
-            *[
+        # Use ModuleList instead of Sequential for checkpointing
+        self.body = nn.ModuleList(
+            [
                 ResidualGroup(
                     channels, window_size, num_heads, num_rcab,
                     ffn_expansion, oca_overlap,
@@ -96,7 +99,13 @@ class FusionSR(nn.Module):
         shallow = self.shallow(x)
 
         # Stage 2
-        deep = self.body(shallow)
+        deep = shallow
+        for block in self.body:
+            if self.use_checkpoint and self.training:
+                deep = checkpoint(block, deep, use_reentrant=False)
+            else:
+                deep = block(deep)
+        
         deep = self.body_conv(deep)
 
         # long skip connection

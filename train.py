@@ -61,6 +61,7 @@ CONFIG = {
     "num_workers": 4,           # dataloader workers
     "weight_decay": 0.01,       # AdamW weight decay
     "grad_clip": 1.0,           # gradient clipping max norm
+    "use_checkpoint": True,     # saves massive VRAM at the cost of ~20% compute time
 
     # ── data paths (set in notebook cell) ──
     "train_hr_dirs": [],        # list of HR image directories
@@ -145,6 +146,7 @@ def main():
         scale=config["scale"],
         ffn_expansion=config["ffn_expansion"],
         oca_overlap=config["oca_overlap"],
+        use_checkpoint=config.get("use_checkpoint", False),
     ).to(device)
 
     print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
