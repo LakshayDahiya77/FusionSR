@@ -58,6 +58,10 @@ class Trainer:
         self.grad_clip = config.get("grad_clip", 0.0)
         self.warmup_epochs = config.get("warmup_epochs", 0)
 
+        # AMP dtype: float16 for T4/V100, bfloat16 for A100+
+        amp = config.get("amp_dtype", "float16")
+        self.amp_dtype = torch.bfloat16 if amp == "bfloat16" else torch.float16
+
         self.best_psnr = 0.0
         self.start_epoch = 0
 
@@ -110,7 +114,7 @@ class Trainer:
             # ── generator forward ──
             self.optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=self.amp_dtype):
                 pred = self.model(lr_imgs)
                 g_loss, loss_dict = self.loss_fn(pred, hr_imgs)
 
@@ -118,7 +122,7 @@ class Trainer:
             if self.discriminator is not None:
                 # D step: maximize D(real) - D(fake)
                 self.disc_optimizer.zero_grad(set_to_none=True)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast("cuda", dtype=self.amp_dtype):
                     fake_logits = self.discriminator(pred.detach())
                     real_logits = self.discriminator(hr_imgs)
                     d_loss = self.gan_loss.discriminator_loss(fake_logits, real_logits)
@@ -127,7 +131,7 @@ class Trainer:
                 self.disc_scaler.update()
 
                 # G's adversarial loss
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast("cuda", dtype=self.amp_dtype):
                     g_fake = self.discriminator(pred)
                     g_real = real_logits.detach()
                     g_gan = self.gan_loss.generator_loss(g_fake, g_real)
@@ -283,7 +287,7 @@ class Trainer:
             lr_imgs = lr_imgs.to(self.device)
             hr_imgs = hr_imgs.to(self.device).float()
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=self.amp_dtype):
                 pred = self.model(lr_imgs).float().clamp(0, 1)
 
             # crop to original HR size (model handles window padding)
