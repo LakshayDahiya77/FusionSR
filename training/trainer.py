@@ -19,7 +19,7 @@ import torch.nn as nn
 import wandb
 
 from utils.metrics import psnr_y, ssim_y
-from data.datasets import gpu_augment
+from data.datasets import gpu_augment, generate_lr_on_gpu
 
 
 class Trainer:
@@ -73,9 +73,15 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
 
-        for lr_imgs, hr_imgs in self.train_dl:
-            lr_imgs = lr_imgs.to(self.device, non_blocking=True)
-            hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+        for batch in self.train_dl:
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                lr_imgs, hr_imgs = batch
+                lr_imgs = lr_imgs.to(self.device, non_blocking=True)
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+            else:
+                hr_imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+                lr_imgs = generate_lr_on_gpu(hr_imgs, scale=self.config["scale"])
             lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -150,15 +156,15 @@ class Trainer:
         """Log visual comparison (bicubic | SR | HR) to W&B Media tab."""
         panels = []
         for s in samples:
+            h, w = s["hr"].shape[-2], s["hr"].shape[-1]
             lr_up = (
                 torch.nn.functional.interpolate(
-                    s["lr"].unsqueeze(0), scale_factor=4,
+                    s["lr"].unsqueeze(0), size=(h, w),
                     mode="bicubic", align_corners=False,
                 )
                 .squeeze(0)
                 .clamp(0, 1)
             )
-            h, w = s["hr"].shape[-2], s["hr"].shape[-1]
             lr_up = lr_up[:, :h, :w]
             sr = s["sr"][:, :h, :w]
             comparison = torch.cat([lr_up, sr, s["hr"]], dim=2)
@@ -225,15 +231,8 @@ class Trainer:
             anneal_strategy="cos",
             div_factor=25,            # initial_lr = max_lr / 25
             final_div_factor=1e4,     # final_lr = initial_lr / 10000
+            last_epoch=self.start_epoch * steps_per_epoch - 1,
         )
-
-        # fast-forward scheduler if resuming mid-training
-        if self.start_epoch > 0:
-            steps_to_skip = self.start_epoch * steps_per_epoch
-            print(f"fast-forwarding scheduler by {steps_to_skip} steps "
-                  f"({self.start_epoch} epochs)...")
-            for _ in range(steps_to_skip):
-                self.scheduler.step()
 
         print(f"training: epochs {self.start_epoch}→{total_epochs - 1} "
               f"({total_epochs - self.start_epoch} epochs)")

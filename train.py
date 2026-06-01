@@ -27,6 +27,7 @@ Usage (Colab notebook cell):
 """
 
 import os
+import copy
 import glob
 import torch
 import wandb
@@ -95,7 +96,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
-    config = CONFIG.copy()
+    config = copy.deepcopy(CONFIG)
 
     if config.get("allow_tf32", False):
         torch.backends.cuda.matmul.allow_tf32 = True

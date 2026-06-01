@@ -408,6 +408,7 @@ class OverlappingCrossAttention(nn.Module):
         window_size: int,
         num_heads: int,
         overlap: int = 4,
+        ffn_expansion: float = 2.0,
     ):
         super().__init__()
         self.channels = channels
@@ -421,6 +422,8 @@ class OverlappingCrossAttention(nn.Module):
         self.q_proj = nn.Linear(channels, channels, bias=True)
         self.kv_proj = nn.Linear(channels, channels * 2, bias=True)
         self.out_proj = nn.Linear(channels, channels, bias=True)
+        self.norm2 = ChannelLayerNorm(channels)
+        self.gdfn = GDFN(channels, expansion=ffn_expansion)
 
     def _overlapping_partition(self, x: torch.Tensor) -> torch.Tensor:
         """Extract overlapping windows for K/V.
@@ -492,7 +495,9 @@ class OverlappingCrossAttention(nn.Module):
         out = window_reverse(out, ws, H, W)
         out = out.permute(0, 3, 1, 2)  # [B, C, H, W]
 
-        return shortcut + out
+        x = shortcut + out
+        x = x + self.gdfn(self.norm2(x))
+        return x
 
 
 # ─────────────────────────────────────────
@@ -525,7 +530,13 @@ class ResidualGroup(nn.Module):
         self.rcab_blocks = nn.Sequential(*[RCAB(channels) for _ in range(num_rcab)])
         self.cab = ChannelAttentionBridge(channels)
         self.swin_pair = SwinBlockPair(channels, window_size, num_heads, ffn_expansion)
-        self.oca = OverlappingCrossAttention(channels, window_size, num_heads, oca_overlap)
+        self.oca = OverlappingCrossAttention(
+            channels,
+            window_size,
+            num_heads,
+            oca_overlap,
+            ffn_expansion=ffn_expansion,
+        )
         self.conv = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
