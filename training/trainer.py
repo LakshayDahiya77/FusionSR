@@ -14,6 +14,7 @@ Features:
 
 import os
 import time
+import math
 import torch
 import torch.nn as nn
 import wandb
@@ -219,25 +220,37 @@ class Trainer:
     def fit(self):
         total_epochs = self.config["total_epochs"]
         lr_max = self.config["lr_max"]
+        min_lr = self.config.get("min_lr", 1e-7)
+        warmup_epochs = self.config.get("warmup_epochs", 0)
         steps_per_epoch = len(self.train_dl)
         total_steps = total_epochs * steps_per_epoch
+        warmup_steps = min(warmup_epochs * steps_per_epoch, total_steps)
+        min_factor = min_lr / lr_max
 
-        # create OneCycleLR for the full schedule
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return (step + 1) / warmup_steps
+
+            if total_steps <= warmup_steps:
+                return 1.0
+
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return cosine * (1.0 - min_factor) + min_factor
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            max_lr=lr_max,
-            total_steps=total_steps,
-            pct_start=0.05,           # 5% warmup
-            anneal_strategy="cos",
-            div_factor=25,            # initial_lr = max_lr / 25
-            final_div_factor=1e4,     # final_lr = initial_lr / 10000
+            lr_lambda=lr_lambda,
             last_epoch=self.start_epoch * steps_per_epoch - 1,
         )
 
         print(f"training: epochs {self.start_epoch}→{total_epochs - 1} "
               f"({total_epochs - self.start_epoch} epochs)")
-        print(f"OneCycleLR: max_lr={lr_max:.1e} | steps/epoch={steps_per_epoch} | "
-              f"total_steps={total_steps}")
+        print(
+            f"Warmup+Cosine: warmup_epochs={warmup_epochs} | min_lr={min_lr:.1e} | "
+            f"steps/epoch={steps_per_epoch} | total_steps={total_steps}"
+        )
         print(f"gradient clipping: max_norm={self.grad_clip}")
         print("-" * 60)
 

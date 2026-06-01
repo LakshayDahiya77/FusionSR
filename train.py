@@ -62,6 +62,8 @@ CONFIG = {
     "num_workers": 4,           # dataloader workers
     "weight_decay": 0.01,       # AdamW weight decay
     "grad_clip": 1.0,           # gradient clipping max norm
+    "warmup_epochs": 8,         # linear warmup epochs
+    "min_lr": 1e-7,             # cosine decay target
     "allow_tf32": True,         # enable TF32 on Ampere+ for faster matmul/conv
     "matmul_precision": "high", # torch.set_float32_matmul_precision
     "use_compile": False,       # torch.compile (PyTorch 2.x)
