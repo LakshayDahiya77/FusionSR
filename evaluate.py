@@ -22,7 +22,6 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from kaggle_secrets import UserSecretsClient
 from huggingface_hub import hf_hub_download
 from models.fusionsr import FusionSR
 from utils.metrics import psnr, ssim, psnr_y, ssim_y, rgb_to_y
@@ -339,14 +338,6 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    # W&B login
-    try:
-        from kaggle_secrets import UserSecretsClient
-
-        secrets = UserSecretsClient()
-        wandb.login(key=secrets.get_secret("WANDB_API_KEY"))
-    except Exception:
-        pass  # running locally without Kaggle secrets
 
     models_to_eval = []
 
