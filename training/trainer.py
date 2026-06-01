@@ -85,6 +85,11 @@ class Trainer:
 
         os.makedirs(save_dir, exist_ok=True)
 
+        # tell W&B to use "epoch" field as x-axis (avoids step conflicts on resume)
+        if self.is_main:
+            wandb.define_metric("epoch")
+            wandb.define_metric("*", step_metric="epoch")
+
     # ── single training epoch ─────────────
     def train_epoch(self, epoch: int) -> float:
         """Run one training epoch. Returns average loss."""
@@ -275,7 +280,7 @@ class Trainer:
             comparison = torch.cat([lr_up, sr, s["hr"]], dim=2)
             img = comparison.permute(1, 2, 0).numpy()
             panels.append(wandb.Image(img, caption="bicubic | SR | HR"))
-        wandb.log({"samples": panels}, step=epoch)
+        wandb.log({"samples": panels})
 
     # ── benchmark validation ──────────────
     @torch.no_grad()
@@ -410,7 +415,7 @@ class Trainer:
                     )
 
             if self.is_main:
-                wandb.log(log_dict, step=epoch)
+                wandb.log(log_dict)
 
         if self.is_main:
             print("-" * 60)
