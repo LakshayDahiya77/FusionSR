@@ -1,34 +1,22 @@
 """
 FusionSR-v4 training entry point.
 
-Usage (Colab notebook cell):
+Kaggle T4x2 DDP Support.
+
+Usage (Kaggle notebook cell):
 
     import train
-
-    train.CONFIG.update({
-        # Data paths (set after downloading/unzipping)
-        'train_hr_dirs': ['/content/DIV2K_train_HR', '/content/Flickr2K_HR'],
-        'train_lr_dirs': ['/content/DIV2K_train_LR_bicubic/X4', '/content/Flickr2K_LR_bicubic/X4'],
-        'val_hr_dir': '/content/Set5/GTmod12',
-        'val_lr_dir': '/content/Set5/LRbicx4',
-
-        # Training
-        'total_epochs': 150,
-        'start_epoch': 0,
-        'lr_max': 3e-4,
-        'batch_size': 16,
-        'patch_lr': 128,
-
-        # W&B
-        'wandb_run': 'v4-phase1',
-    })
-
+    train.CONFIG.update({...})
     train.main()
 """
 
 import os
+import json
+import tempfile
 import glob
 import torch
+import torch.multiprocessing as mp
+import torch.distributed as dist
 import wandb
 
 from models.fusionsr import FusionSR, count_parameters
@@ -51,75 +39,73 @@ CONFIG = {
     "scale": 4,
     "ffn_expansion": 2.0,
     "oca_overlap": 4,
-
-    # ── training ──
-    "total_epochs": 150,        # OneCycleLR schedule length
-    "start_epoch": 0,           # resume from this epoch
-    "lr_max": 3e-4,             # OneCycleLR peak LR
-    "batch_size": 16,           # adjust based on GPU VRAM
-    "patch_lr": 128,            # LR patch size (HR = 512)
-    "num_workers": 4,           # dataloader workers
-    "weight_decay": 0.01,       # AdamW weight decay
-    "grad_clip": 1.0,           # gradient clipping max norm
     "use_checkpoint": True,     # saves massive VRAM at the cost of ~20% compute time
 
-    # ── data paths (set in notebook cell) ──
-    "train_hr_dirs": [],        # list of HR image directories
-    "train_lr_dirs": [],        # list of LR directories (empty = generate on-the-fly)
-    "val_hr_dir": "",           # Set5 GTmod12 path
-    "val_lr_dir": "",           # Set5 LRbicx4 path
+    # ── training ──
+    "total_epochs": 150,        
+    "start_epoch": 0,           
+    "lr_max": 3e-4,             
+    "batch_size": 8,            # per-GPU batch size
+    "patch_lr": 128,            
+    "num_workers": 2,           # per-GPU workers
+    "weight_decay": 0.01,       
+    "grad_clip": 1.0,           
+
+    # ── data paths ──
+    "train_hr_dirs": [],        
+    "train_lr_dirs": [],        
+    "val_hr_dir": "",           
+    "val_lr_dir": "",           
 
     # ── W&B ──
     "wandb_entity": "lakshay_dahiya77",
     "wandb_project": "FusionSR-v4",
-    "wandb_run": "v4-phase1",
-    "wandb_run_id": None,       # set to resume same W&B run
+    "wandb_run": "v4-kaggle-phase1",
+    "wandb_run_id": None,       
 
     # ── resume ──
-    "resume": None,             # W&B artifact name or local .pt path
+    "resume": None,             
 
     # ── paths ──
-    "save_dir": "/content/checkpoints",
+    "save_dir": "/kaggle/working/checkpoints",
 }
 
 
-def main():
-    """Single-GPU training entry point."""
+def _train_worker(rank: int, world_size: int, config_file: str):
+    """Worker process for DDP training."""
+    # load config from temp file (preserves notebook overrides)
+    with open(config_file, "r") as f:
+        config = json.load(f)
+
+    # Initialize process group
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    torch.backends.cudnn.benchmark = True
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
+    if rank == 0:
+        print(f"\nInitialized DDP with {world_size} GPUs")
+        
+        # W&B init only on rank 0
+        wandb_kwargs = {
+            "entity": config["wandb_entity"],
+            "project": config["wandb_project"],
+            "config": config,
+        }
+        if config["wandb_run_id"]:
+            wandb_kwargs["id"] = config["wandb_run_id"]
+            wandb_kwargs["resume"] = "must"
+        else:
+            wandb_kwargs["name"] = config["wandb_run"]
 
-    config = CONFIG.copy()
-
-    # ── GPU info ──
-    print(f"\ndevice: {device}")
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(device)
-        print(f"GPU: {props.name} ({props.total_memory / 1024**3:.1f}GB)")
-
-    # ── W&B ──
-    wandb.login()
-
-    wandb_kwargs = {
-        "entity": config["wandb_entity"],
-        "project": config["wandb_project"],
-        "config": config,
-    }
-    if config["wandb_run_id"]:
-        wandb_kwargs["id"] = config["wandb_run_id"]
-        wandb_kwargs["resume"] = "must"
-    else:
-        wandb_kwargs["name"] = config["wandb_run"]
-
-    run = wandb.init(**wandb_kwargs)
-    print(f"W&B run ID: {run.id}\n")
+        run = wandb.init(**wandb_kwargs)
+        print(f"W&B run ID: {run.id}\n")
 
     # ── dataloaders ──
-    assert config["train_hr_dirs"], "Set CONFIG['train_hr_dirs'] to a list of HR directories"
-    assert config["val_hr_dir"], "Set CONFIG['val_hr_dir'] to Set5 GTmod12 path"
-    assert config["val_lr_dir"], "Set CONFIG['val_lr_dir'] to Set5 LRbicx4 path"
-
     train_dl = make_train_dl(
         hr_dirs=config["train_hr_dirs"],
         lr_dirs=config["train_lr_dirs"] or None,
@@ -127,6 +113,7 @@ def main():
         batch_size=config["batch_size"],
         num_workers=config["num_workers"],
         scale=config["scale"],
+        distributed=True,
     )
 
     valid_dl = make_benchmark_dl(
@@ -134,7 +121,8 @@ def main():
         lr_dir=config["val_lr_dir"],
     )
 
-    print(f"train batches: {len(train_dl)} | valid images: {len(valid_dl)}")
+    if rank == 0:
+        print(f"train batches/gpu: {len(train_dl)} | valid images: {len(valid_dl)}")
 
     # ── model ──
     model = FusionSR(
@@ -149,7 +137,8 @@ def main():
         use_checkpoint=config.get("use_checkpoint", False),
     ).to(device)
 
-    print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
+    if rank == 0:
+        print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
     # ── loss ──
     loss_fn = CombinedSRLoss(pixel_weight=1.0, use_perceptual=False).to(device)
@@ -171,38 +160,70 @@ def main():
         valid_dl=valid_dl,
         config=config,
         device=device,
+        rank=rank,
+        world_size=world_size,
         save_dir=config["save_dir"],
     )
 
     # ── resume ──
     if config["resume"]:
         resume_path = config["resume"]
+        ckpt_path = resume_path
 
         if "/" in resume_path:
-            # W&B artifact — download
-            print(f"downloading artifact: {resume_path}")
-            artifact = wandb.use_artifact(resume_path, type="model")
-            artifact_dir = artifact.download()
-            pt_files = glob.glob(os.path.join(artifact_dir, "*.pt"))
-            assert pt_files, f"No .pt files found in artifact {resume_path}"
-            ckpt_path = pt_files[0]
-        else:
-            ckpt_path = resume_path
-
+            # W&B artifact
+            if rank == 0:
+                print(f"downloading artifact: {resume_path}")
+                artifact = wandb.use_artifact(resume_path, type="model")
+                artifact_dir = artifact.download()
+                pt_files = glob.glob(os.path.join(artifact_dir, "*.pt"))
+                ckpt_path = pt_files[0]
+                # save path for other ranks
+                with open("/tmp/fusionsr_ckpt_path.txt", "w") as f:
+                    f.write(ckpt_path)
+            
+            # Wait for rank 0 to finish downloading and saving path
+            dist.barrier()
+            
+            if rank != 0:
+                with open("/tmp/fusionsr_ckpt_path.txt", "r") as f:
+                    ckpt_path = f.read().strip()
+                    
         trainer.load_checkpoint(ckpt_path)
 
     # ── train ──
     trainer.fit()
 
-    # ── post-training benchmark ──
-    print("\n" + "=" * 60)
-    print("post-training benchmark")
-    print("=" * 60)
-    m = trainer.validate_benchmark(valid_dl, "Set5")
-    print(f"  Set5 — PSNR(Y): {m['psnr']:.2f}dB | SSIM(Y): {m['ssim']:.4f}")
+    if rank == 0:
+        wandb.finish()
+        print("\ndone.")
+        
+    dist.destroy_process_group()
 
-    wandb.finish()
-    print("\ndone.")
+
+def main():
+    """Main entry point. Launches multiprocessing for available GPUs."""
+    world_size = torch.cuda.device_count()
+    if world_size < 1:
+        raise RuntimeError("No GPUs found. Kaggle requires GPUs for this script.")
+        
+    print(f"Detected {world_size} GPUs. Launching DDP...")
+
+    # save config to temp JSON so spawned processes can read overrides
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(CONFIG, f)
+
+    try:
+        mp.spawn(
+            _train_worker,
+            args=(world_size, path),
+            nprocs=world_size,
+            join=True,
+        )
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 if __name__ == "__main__":

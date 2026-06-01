@@ -228,6 +228,7 @@ def make_train_dl(
     batch_size: int = 16,
     num_workers: int = 4,
     scale: int = 4,
+    distributed: bool = False,
 ) -> DataLoader:
     """Create training dataloader.
 
@@ -250,10 +251,14 @@ def make_train_dl(
         # HR-only — LR generated on-the-fly
         ds = HROnlyDataset(hr_dirs, patch_lr=patch_lr, scale=scale)
 
+    from torch.utils.data.distributed import DistributedSampler
+    sampler = DistributedSampler(ds, shuffle=True) if distributed else None
+
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
