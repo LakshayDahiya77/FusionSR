@@ -172,8 +172,8 @@ def window_partition(x: torch.Tensor, window_size: int):
     Returns [num_windows*B, window_size, window_size, C].
     """
     B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    x = x.reshape(B, H // window_size, window_size, W // window_size, window_size, C)
+    return x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size, window_size, C)
 
 
 def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
@@ -182,8 +182,8 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
     """
     nW = (H // window_size) * (W // window_size)
     B = windows.shape[0] // nW
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
+    return x.permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, -1)
 
 
 class WindowAttention(nn.Module):
@@ -224,24 +224,26 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        q, k, v = qkv.unbind(0)  # each [B_, num_heads, N, head_dim]
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
-
-        # relative position bias
+        # relative position bias: [1, num_heads, N, N]
         bias = self.rel_pos_bias_table[self.rel_pos_index.view(-1)]
-        bias = bias.view(N, N, self.num_heads).permute(2, 0, 1).unsqueeze(0)
-        attn = attn + bias
+        bias = bias.reshape(N, N, self.num_heads).permute(2, 0, 1).unsqueeze(0)
 
-        # shift mask for SW-MSA
+        # combine bias with shift mask for fused SDPA kernel
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
-            attn = attn + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            B = B_ // nW
+            # mask [nW, N, N] → tile across batch → [B*nW, 1, N, N]
+            attn_mask = bias + mask.repeat(B, 1, 1).unsqueeze(1)
+        else:
+            attn_mask = bias
 
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        # fused attention: Q·K^T scaling + mask + softmax + V in one kernel
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, scale=self.scale
+        )
+        x = x.transpose(1, 2).reshape(B_, N, C)
         return self.proj(x)
 
 
@@ -295,9 +297,9 @@ class SwinBlock(nn.Module):
 
         # window partition → attention → window reverse
         windows = window_partition(x_bhwc, self.window_size)
-        windows = windows.view(-1, self.window_size ** 2, C)
+        windows = windows.reshape(-1, self.window_size ** 2, C)
         windows = self.attn(windows, mask=attn_mask)
-        windows = windows.view(-1, self.window_size, self.window_size, C)
+        windows = windows.reshape(-1, self.window_size, self.window_size, C)
         x_bhwc = window_reverse(windows, self.window_size, H, W)
 
         # reverse cyclic shift
@@ -361,7 +363,7 @@ class SwinBlockPair(nn.Module):
                 cnt += 1
 
         mask_windows = window_partition(img_mask, self.window_size)
-        mask_windows = mask_windows.view(-1, self.window_size ** 2)
+        mask_windows = mask_windows.reshape(-1, self.window_size ** 2)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0)
         attn_mask = attn_mask.masked_fill(attn_mask == 0, 0.0)

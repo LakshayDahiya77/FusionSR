@@ -93,31 +93,31 @@ class DIV2KDatasetFast(Dataset):
         return len(self.lr_images)
 
     def __getitem__(self, idx):
-        lr = torch.from_numpy(self.lr_images[idx]).permute(2, 0, 1).float() / 255.0
-        hr = (
-            np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.uint8)
-        )
-        hr = torch.from_numpy(hr).permute(2, 0, 1).float() / 255.0
+        lr_np = self.lr_images[idx]          # [H, W, 3] uint8 in RAM
+        hr_np = np.array(Image.open(self.hr_paths[idx]).convert("RGB"), dtype=np.uint8)
 
         if self.training:
-            lr, hr = self._random_crop(lr, hr)
+            lr_np, hr_np = self._random_crop(lr_np, hr_np)
 
+        lr = torch.from_numpy(lr_np.copy()).permute(2, 0, 1).float().div_(255.0)
+        hr = torch.from_numpy(hr_np.copy()).permute(2, 0, 1).float().div_(255.0)
         return lr, hr
 
-    def _random_crop(self, lr: torch.Tensor, hr: torch.Tensor):
-        _, h, w = lr.shape
+    def _random_crop(self, lr: np.ndarray, hr: np.ndarray):
+        """Random crop on uint8 numpy arrays [H, W, 3]. Avoids full-image float32."""
+        h, w = lr.shape[:2]
         p = self.patch_lr
 
         if h < p or w < p:
-            lr = F.pad(lr, (0, max(0, p - w), 0, max(0, p - h)))
-            hr = F.pad(hr, (0, max(0, p - w) * 4, 0, max(0, p - h) * 4))
-            _, h, w = lr.shape
+            lr = np.pad(lr, ((0, max(0, p - h)), (0, max(0, p - w)), (0, 0)), mode='reflect')
+            hr = np.pad(hr, ((0, max(0, (p - h) * 4)), (0, max(0, (p - w) * 4)), (0, 0)), mode='reflect')
+            h, w = lr.shape[:2]
 
-        x = torch.randint(0, w - p + 1, (1,)).item()
-        y = torch.randint(0, h - p + 1, (1,)).item()
+        x = random.randint(0, w - p)
+        y = random.randint(0, h - p)
 
-        lr = lr[:, y : y + p, x : x + p]
-        hr = hr[:, y * 4 : y * 4 + p * 4, x * 4 : x * 4 + p * 4]
+        lr = lr[y:y + p, x:x + p]
+        hr = hr[y * 4:y * 4 + p * 4, x * 4:x * 4 + p * 4]
         return lr, hr
 
 
@@ -241,6 +241,7 @@ def make_train_dataloader(
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
+        prefetch_factor=4,
     )
 
 
@@ -274,6 +275,7 @@ def make_combined_dataloader(
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
+        prefetch_factor=4,
     )
 
 
@@ -294,6 +296,7 @@ def make_satellite_dataloader(
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
+        prefetch_factor=4,
     )
 
 
