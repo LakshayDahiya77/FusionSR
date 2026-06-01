@@ -12,10 +12,14 @@ Supports:
 
 import os
 import time
+import warnings
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import wandb
+
+# suppress harmless DDP grad stride mismatch warnings from 1×1 convolutions
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
 
 from utils.metrics import psnr, ssim
 from data.datasets import gpu_augment
@@ -221,7 +225,7 @@ class Trainer:
 
         if reset_best_psnr:
             self.best_psnr = 0.0
-            self.start_epoch = 0
+            self.start_epoch = ckpt["epoch"] + 1  # keep epoch counter (W&B needs monotonic steps)
 
             lr_max = self.config["lr_max"]
             lr_min = self.config["lr_min"]
