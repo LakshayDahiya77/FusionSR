@@ -192,14 +192,14 @@ def main():
         ffn_expansion=CONFIG["ffn_expansion"],
     )
 
-    # torch.compile: fuse ops + CUDA graphs for fixed-size patches
-    # first epoch is slower (compilation), rest are 15-30% faster
-    model = torch.compile(model, mode="reduce-overhead")
-
     # DataParallel for T4×2 — batch split across GPUs
     if n_gpu > 1:
         print(f"using {n_gpu} GPUs via DataParallel")
         model = torch.nn.DataParallel(model)
+    else:
+        # torch.compile: fuse ops + CUDA graphs for fixed-size patches
+        # incompatible with DataParallel — only used on single GPU
+        model = torch.compile(model, mode="reduce-overhead")
     model = model.to(device)
     print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
