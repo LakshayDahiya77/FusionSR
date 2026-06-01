@@ -227,6 +227,9 @@ class Trainer:
         warmup_steps = min(warmup_epochs * steps_per_epoch, total_steps)
         min_factor = min_lr / lr_max
 
+        for group in self.optimizer.param_groups:
+            group.setdefault("initial_lr", lr_max)
+
         def lr_lambda(step: int) -> float:
             if warmup_steps > 0 and step < warmup_steps:
                 return (step + 1) / warmup_steps
