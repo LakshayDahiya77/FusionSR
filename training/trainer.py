@@ -112,13 +112,19 @@ class Trainer:
         avg_loss = total_loss / len(self.train_dl)
         return self._all_reduce_mean(avg_loss)
 
+    def _unwrap(self):
+        """Return unwrapped model for evaluation/saving (bypasses DDP hooks)."""
+        return self.model.module if hasattr(self.model, "module") else self.model
+
     # ── benchmark validation (Y-channel) ──
     @torch.no_grad()
     def validate_benchmark(self, benchmark_dl, name: str) -> dict:
         """Validate on benchmark dataset. Returns psnr, ssim (Y-channel), samples."""
         if not self.is_master:
             return {"psnr": 0.0, "ssim": 0.0, "samples": []}
-        self.model.eval()
+        
+        model = self._unwrap()
+        model.eval()
         total_psnr = 0.0
         total_ssim = 0.0
         samples = []
@@ -129,7 +135,7 @@ class Trainer:
             hr_imgs = hr_imgs.to(self.device).float()
 
             with torch.autocast("cuda", dtype=self.amp_dtype):
-                pred = self.model(lr_imgs).float().clamp(0, 1)
+                pred = model(lr_imgs).float().clamp(0, 1)
 
             # crop to original HR size (model handles window padding)
             hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
@@ -187,7 +193,7 @@ class Trainer:
 
         ckpt = {
             "epoch": epoch,
-            "model": self.model.state_dict(),
+            "model": self._unwrap().state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler": self.scaler.state_dict(),
@@ -209,20 +215,21 @@ class Trainer:
     def load_checkpoint(self, path: str):
         """Load model weights from checkpoint. Scheduler/optimizer are fresh."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt["model"])
+        self._unwrap().load_state_dict(ckpt["model"])
 
         # always start fresh — epoch and LR come from config, not checkpoint
         self.start_epoch = self.config["start_epoch"]
         self.best_psnr = 0.0
 
         m = ckpt.get("metrics", {})
-        print(f"── checkpoint loaded ──")
-        print(f"  source epoch: {ckpt.get('epoch', '?')}")
-        print(f"  PSNR (Y): {m.get('psnr', 'N/A')}")
-        print(f"  SSIM (Y): {m.get('ssim', 'N/A')}")
-        print(f"── training config ──")
-        print(f"  start_epoch: {self.start_epoch}")
-        print(f"  lr_max: {self.config['lr_max']}")
+        if self.is_master:
+            print(f"── checkpoint loaded ──")
+            print(f"  source epoch: {ckpt.get('epoch', '?')}")
+            print(f"  PSNR (Y): {m.get('psnr', 'N/A')}")
+            print(f"  SSIM (Y): {m.get('ssim', 'N/A')}")
+            print(f"── training config ──")
+            print(f"  start_epoch: {self.start_epoch}")
+            print(f"  lr_max: {self.config['lr_max']}")
 
     # ── main training loop ────────────────
     def fit(self):
@@ -245,17 +252,19 @@ class Trainer:
         # fast-forward scheduler if resuming mid-training
         if self.start_epoch > 0:
             steps_to_skip = self.start_epoch * steps_per_epoch
-            print(f"fast-forwarding scheduler by {steps_to_skip} steps "
-                  f"({self.start_epoch} epochs)...")
+            if self.is_master:
+                print(f"fast-forwarding scheduler by {steps_to_skip} steps "
+                      f"({self.start_epoch} epochs)...")
             for _ in range(steps_to_skip):
                 self.scheduler.step()
 
-        print(f"training: epochs {self.start_epoch}→{total_epochs - 1} "
-              f"({total_epochs - self.start_epoch} epochs)")
-        print(f"OneCycleLR: max_lr={lr_max:.1e} | steps/epoch={steps_per_epoch} | "
-              f"total_steps={total_steps}")
-        print(f"gradient clipping: max_norm={self.grad_clip}")
-        print("-" * 60)
+        if self.is_master:
+            print(f"training: epochs {self.start_epoch}→{total_epochs - 1} "
+                  f"({total_epochs - self.start_epoch} epochs)")
+            print(f"OneCycleLR: max_lr={lr_max:.1e} | steps/epoch={steps_per_epoch} | "
+                  f"total_steps={total_steps}")
+            print(f"gradient clipping: max_norm={self.grad_clip}")
+            print("-" * 60)
 
         for epoch in range(self.start_epoch, total_epochs):
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -312,6 +321,10 @@ class Trainer:
                     f"train {train_time:.0f}s | val {val_time:.0f}s | "
                     f"LR {current_lr:.2e}{best_marker}"
                 )
+            
+            # Prevent deadlocks by keeping DDP processes perfectly synced
+            if self.is_distributed:
+                dist.barrier()
 
         if self.is_master:
             print("-" * 60)
