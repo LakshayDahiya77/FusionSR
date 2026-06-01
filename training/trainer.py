@@ -206,74 +206,41 @@ class Trainer:
         artifact.add_file(path)
         wandb.log_artifact(artifact)
 
-    def load_checkpoint(self, path: str, reset_best_psnr: bool = False):
+    def load_checkpoint(self, path: str):
+        """Load model weights from checkpoint. Scheduler and epoch come from config."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
-        # load model weights (unwrap DDP + torch.compile)
+        # load model weights (unwrap DDP)
         self._unwrap(self.model).load_state_dict(ckpt["model"])
 
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.scaler.load_state_dict(ckpt["scaler"])
+        # start_epoch and scheduler come from config, not checkpoint
+        self.start_epoch = self.config["start_epoch"]
+        self.best_psnr = 0.0
 
-        # load discriminator if present in checkpoint and currently active
-        if self.discriminator is not None and "discriminator" in ckpt:
-            self._unwrap(self.discriminator).load_state_dict(ckpt["discriminator"])
-            if "disc_optimizer" in ckpt:
-                self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
-            if "disc_scaler" in ckpt:
-                self.disc_scaler.load_state_dict(ckpt["disc_scaler"])
+        # fresh scheduler with current config
+        lr_max = self.config["lr_max"]
+        lr_min = self.config["lr_min"]
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr_max
+            pg["initial_lr"] = lr_max
 
-        if reset_best_psnr:
-            self.best_psnr = 0.0
-            self.start_epoch = ckpt["epoch"] + 1  # keep epoch counter (W&B needs monotonic steps)
-
-            lr_max = self.config["lr_max"]
-            lr_min = self.config["lr_min"]
-            for pg in self.optimizer.param_groups:
-                pg["lr"] = lr_max
-                pg["initial_lr"] = lr_max  # scheduler reads initial_lr, not lr
-
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.optimizer,
-                T_0=self.config["sgdr_t0"],
-                T_mult=1,
-                eta_min=lr_min,
-            )
-            if self.is_main:
-                print(f"scheduler reset | lr_max={lr_max} | lr_min={lr_min}")
-        else:
-            if "scheduler" in ckpt:
-                self.scheduler.load_state_dict(ckpt["scheduler"])
-            self.best_psnr = ckpt["best_psnr"]
-            self.start_epoch = ckpt["epoch"] + 1
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=self.config["sgdr_t0"],
+            T_mult=1,
+            eta_min=lr_min,
+        )
 
         if self.is_main:
-            # show checkpoint stats so user can verify correct weights
             m = ckpt.get("metrics", {})
             ckpt_cfg = ckpt.get("config", {})
             print(f"── checkpoint loaded ──")
-            print(f"  epoch:    {ckpt['epoch']}")
-            print(f"  PSNR:     {m.get('psnr', 'N/A')}")
-            print(f"  SSIM:     {m.get('ssim', 'N/A')}")
-            print(f"  best PSNR (saved): {ckpt.get('best_psnr', 'N/A')}")
-            print(f"  trained with lr:   {ckpt_cfg.get('lr_max', 'N/A')}")
-            print(f"  trained with T0:   {ckpt_cfg.get('sgdr_t0', 'N/A')}")
-            print(f"── resume config ──")
-            print(f"  start_epoch: {self.start_epoch} | best_psnr: {self.best_psnr:.2f}dB")
-
-    @staticmethod
-    def download_checkpoint(project: str, tag: str = "latest", version: str = "latest") -> str:
-        """Download checkpoint from W&B artifacts.
-        
-        Args:
-            tag: 'best' or 'latest' — artifact name
-            version: 'latest', 'v0', 'v1', etc. — artifact version
-        """
-        artifact_ref = f"fusionsr-{tag}:{version}"
-        print(f"downloading artifact: {artifact_ref}")
-        artifact = wandb.use_artifact(artifact_ref, type="model")
-        artifact_dir = artifact.download()
-        return os.path.join(artifact_dir, f"fusionsr_{tag}.pt")
+            print(f"  source epoch: {ckpt.get('epoch', '?')}")
+            print(f"  PSNR:  {m.get('psnr', 'N/A')}")
+            print(f"  SSIM:  {m.get('ssim', 'N/A')}")
+            print(f"── training config ──")
+            print(f"  start_epoch: {self.start_epoch}")
+            print(f"  lr_max: {lr_max} | T0: {self.config['sgdr_t0']}")
 
     # ── W&B sample logging ────────────────
     def _log_samples(self, samples: list, epoch: int):

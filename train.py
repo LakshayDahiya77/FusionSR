@@ -92,10 +92,8 @@ CONFIG = {
     "wandb_run_id": None,       # set to resume existing run
 
     # ── resume ──
-    "resume": None,             # None | "wandb" | "/path/to/ckpt.pt"
-    "resume_tag": "best",       # "best" or "latest" — which W&B artifact to resume from
-    "resume_version": "latest", # "latest", "v0", "v1" — artifact version (check W&B Artifacts tab)
-    "reset_best_psnr": False,   # reset best PSNR and scheduler on resume
+    "resume": None,             # W&B artifact name (e.g. "user/project/fusionsr-best:v260") or local path
+    "start_epoch": 0,           # epoch number to start from
 
     # ── paths ──
     "save_dir": "/kaggle/working/checkpoints",
@@ -297,25 +295,29 @@ def _run_training(rank, world_size, device, is_main, use_ddp, config):
 
     # ── resume ──
     if config["resume"]:
-        if config["resume"] == "wandb":
+        resume_path = config["resume"]
+
+        # download from W&B if it looks like an artifact name
+        if "/" in resume_path:
             if is_main:
-                ckpt_path = Trainer.download_checkpoint(
-                    config["wandb_project"],
-                    tag=config["resume_tag"],
-                    version=config["resume_version"],
-                )
+                print(f"downloading artifact: {resume_path}")
+                artifact = wandb.use_artifact(resume_path, type="model")
+                artifact_dir = artifact.download()
+                # find the .pt file inside
+                import glob
+                pt_files = glob.glob(os.path.join(artifact_dir, "*.pt"))
+                ckpt_path = pt_files[0]
             else:
                 ckpt_path = ""
 
-            # broadcast checkpoint path from rank 0 to all ranks
             if use_ddp:
                 path_list = [ckpt_path]
                 dist.broadcast_object_list(path_list, src=0)
                 ckpt_path = path_list[0]
         else:
-            ckpt_path = config["resume"]
+            ckpt_path = resume_path
 
-        trainer.load_checkpoint(ckpt_path, reset_best_psnr=config["reset_best_psnr"])
+        trainer.load_checkpoint(ckpt_path)
 
     if use_ddp:
         dist.barrier()
