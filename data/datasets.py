@@ -1,11 +1,6 @@
 """
 FusionSR-v4 datasets.
 
-Simplified for single-GPU Colab training:
-    - No DDP / DistributedSampler
-    - No RAM disk setup
-    - User-configurable paths via CONFIG
-
 Datasets:
     PairedSRDataset  — pre-computed LR+HR pairs (DIV2K, Flickr2K)
     HROnlyDataset    — HR-only, generates LR on-the-fly (LSDIR)
@@ -19,6 +14,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from PIL import Image
 
@@ -229,6 +225,8 @@ def make_train_dl(
     num_workers: int = 4,
     scale: int = 4,
     distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     """Create training dataloader.
 
@@ -251,13 +249,20 @@ def make_train_dl(
         # HR-only — LR generated on-the-fly
         ds = HROnlyDataset(hr_dirs, patch_lr=patch_lr, scale=scale)
 
-    from torch.utils.data.distributed import DistributedSampler
-    sampler = DistributedSampler(ds, shuffle=True) if distributed else None
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
 
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=(sampler is None),
+        shuffle=sampler is None,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,

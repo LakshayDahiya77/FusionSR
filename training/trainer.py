@@ -1,16 +1,8 @@
 """
 FusionSR-v4 trainer.
 
-Kaggle T4x2 DDP training.
-
-Features:
-    - DistributedDataParallel support
-    - OneCycleLR scheduler (step per batch)
-    - Y-channel PSNR/SSIM evaluation (matches published papers)
-    - Auto-detect AMP dtype
-    - W&B sample logging every epoch (rank 0 only)
-    - Gradient clipping
-    - Clean checkpoint management (rank 0 only)
+DDP-ready training loop with OneCycleLR, Y-channel evaluation, AMP,
+and W&B logging on the main process only.
 """
 
 import os
@@ -25,7 +17,7 @@ from data.datasets import gpu_augment
 
 
 class Trainer:
-    """Multi-GPU DDP training loop."""
+    """Training loop with OneCycleLR, Y-channel eval, and DDP-safe logging."""
 
     def __init__(
         self,
@@ -38,55 +30,55 @@ class Trainer:
         device: torch.device,
         rank: int = 0,
         world_size: int = 1,
-        save_dir: str = "/content/checkpoints",
+        save_dir: str = "/kaggle/working/checkpoints",
     ):
-        self.rank = rank
-        self.world_size = world_size
-        self.device = device
-        self.save_dir = save_dir
-        self.config = config
-
+        self.model = model
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.train_dl = train_dl
         self.valid_dl = valid_dl
+        self.config = config
+        self.device = device
+        self.rank = rank
+        self.world_size = world_size
+        self.is_master = rank == 0
+        self.is_distributed = world_size > 1 and dist.is_available() and dist.is_initialized()
+        self.save_dir = save_dir
 
         self.grad_clip = config.get("grad_clip", 1.0)
 
-        # auto-detect AMP dtype
+        # auto-detect AMP dtype: bfloat16 on A100+ (compute capability >= 8.0)
         gpu_cap = torch.cuda.get_device_capability(device)
         if gpu_cap[0] >= 8:
             self.amp_dtype = torch.bfloat16
+            # bfloat16 doesn't need loss scaling
             self.scaler = torch.amp.GradScaler("cuda", enabled=False)
-            if self.rank == 0:
-                print(f"AMP: bfloat16 (GPU capability {gpu_cap[0]}.{gpu_cap[1]})")
+            print(f"AMP: bfloat16 (GPU capability {gpu_cap[0]}.{gpu_cap[1]})")
         else:
             self.amp_dtype = torch.float16
             self.scaler = torch.amp.GradScaler("cuda")
-            if self.rank == 0:
-                print(f"AMP: float16 (GPU capability {gpu_cap[0]}.{gpu_cap[1]})")
-
-        # wrap model in DDP
-        self.model = nn.parallel.DistributedDataParallel(
-            model, device_ids=[rank], output_device=rank
-        )
+            print(f"AMP: float16 (GPU capability {gpu_cap[0]}.{gpu_cap[1]})")
 
         self.best_psnr = 0.0
         self.start_epoch = config.get("start_epoch", 0)
+
+        # OneCycleLR — created in fit() after we know steps_per_epoch
         self.scheduler = None
 
-        if self.rank == 0:
-            os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(save_dir, exist_ok=True)
+
+    def _all_reduce_mean(self, value: float) -> float:
+        if not self.is_distributed:
+            return value
+        t = torch.tensor(value, device=self.device, dtype=torch.float32)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t = t / self.world_size
+        return t.item()
 
     # ── single training epoch ─────────────
-    def train_epoch(self, epoch: int) -> float:
-        """Run one training epoch. Returns average loss across all GPUs."""
+    def train_epoch(self) -> float:
+        """Run one training epoch. Returns average loss."""
         self.model.train()
-        
-        # shuffle for DDP
-        if hasattr(self.train_dl.sampler, "set_epoch"):
-            self.train_dl.sampler.set_epoch(epoch)
-
         total_loss = 0.0
 
         for lr_imgs, hr_imgs in self.train_dl:
@@ -111,26 +103,22 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            # OneCycleLR steps per batch
             if self.scheduler is not None:
                 self.scheduler.step()
 
             total_loss += loss.item()
 
-        # average loss across all GPUs
-        avg_loss = torch.tensor(total_loss / len(self.train_dl), device=self.device)
-        dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-        avg_loss = avg_loss / self.world_size
-
-        return avg_loss.item()
+        avg_loss = total_loss / len(self.train_dl)
+        return self._all_reduce_mean(avg_loss)
 
     # ── benchmark validation (Y-channel) ──
     @torch.no_grad()
     def validate_benchmark(self, benchmark_dl, name: str) -> dict:
-        """Validate on benchmark dataset. Run ONLY on rank 0."""
-        # Un-wrap model from DDP for clean inference
-        model = self.model.module
-        model.eval()
-        
+        """Validate on benchmark dataset. Returns psnr, ssim (Y-channel), samples."""
+        if not self.is_master:
+            return {"psnr": 0.0, "ssim": 0.0, "samples": []}
+        self.model.eval()
         total_psnr = 0.0
         total_ssim = 0.0
         samples = []
@@ -141,21 +129,22 @@ class Trainer:
             hr_imgs = hr_imgs.to(self.device).float()
 
             with torch.autocast("cuda", dtype=self.amp_dtype):
-                pred = model(lr_imgs).float().clamp(0, 1)
+                pred = self.model(lr_imgs).float().clamp(0, 1)
 
-            # crop to original HR size
+            # crop to original HR size (model handles window padding)
             hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
             pred = pred[:, :, :hr_h, :hr_w]
 
-            # boundary crop
+            # boundary crop — standard SR evaluation (remove `scale` pixels)
             b = scale
             pred_crop = pred[:, :, b:-b, b:-b]
             hr_crop = hr_imgs[:, :, b:-b, b:-b]
 
-            # Y-channel metrics
+            # Y-channel metrics — matches published SwinIR/HAT numbers
             total_psnr += psnr_y(pred_crop, hr_crop)
             total_ssim += ssim_y(pred_crop, hr_crop)
 
+            # collect samples for W&B (use uncropped for visual comparison)
             samples.append({
                 "lr": lr_imgs[0].detach().cpu(),
                 "sr": pred[0].detach().cpu(),
@@ -169,12 +158,14 @@ class Trainer:
 
     # ── W&B sample logging ────────────────
     def _log_samples(self, samples: list):
-        """Log visual comparison to W&B (rank 0 only)."""
+        """Log visual comparison (bicubic | SR | HR) to W&B Media tab."""
+        if not self.is_master:
+            return
         panels = []
         for s in samples:
             lr_up = (
                 torch.nn.functional.interpolate(
-                    s["lr"].unsqueeze(0), scale_factor=self.config["scale"],
+                    s["lr"].unsqueeze(0), scale_factor=4,
                     mode="bicubic", align_corners=False,
                 )
                 .squeeze(0)
@@ -190,11 +181,13 @@ class Trainer:
 
     # ── checkpoint management ─────────────
     def save_checkpoint(self, epoch: int, metrics: dict, tag: str = "latest"):
-        """Save checkpoint (rank 0 only)."""
+        if not self.is_master:
+            return
         path = os.path.join(self.save_dir, f"fusionsr_{tag}.pt")
+
         ckpt = {
             "epoch": epoch,
-            "model": self.model.module.state_dict(),
+            "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler": self.scaler.state_dict(),
@@ -204,6 +197,7 @@ class Trainer:
         }
         torch.save(ckpt, path)
 
+        # upload to W&B as artifact
         artifact = wandb.Artifact(
             name=f"fusionsr-{tag}",
             type="model",
@@ -213,23 +207,22 @@ class Trainer:
         wandb.log_artifact(artifact)
 
     def load_checkpoint(self, path: str):
-        """Load model weights (all ranks)."""
-        # map to specific GPU to avoid VRAM spikes
+        """Load model weights from checkpoint. Scheduler/optimizer are fresh."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.module.load_state_dict(ckpt["model"])
+        self.model.load_state_dict(ckpt["model"])
 
+        # always start fresh — epoch and LR come from config, not checkpoint
         self.start_epoch = self.config["start_epoch"]
         self.best_psnr = 0.0
 
-        if self.rank == 0:
-            m = ckpt.get("metrics", {})
-            print(f"── checkpoint loaded ──")
-            print(f"  source epoch: {ckpt.get('epoch', '?')}")
-            print(f"  PSNR (Y): {m.get('psnr', 'N/A')}")
-            print(f"  SSIM (Y): {m.get('ssim', 'N/A')}")
-            print(f"── training config ──")
-            print(f"  start_epoch: {self.start_epoch}")
-            print(f"  lr_max: {self.config['lr_max']}")
+        m = ckpt.get("metrics", {})
+        print(f"── checkpoint loaded ──")
+        print(f"  source epoch: {ckpt.get('epoch', '?')}")
+        print(f"  PSNR (Y): {m.get('psnr', 'N/A')}")
+        print(f"  SSIM (Y): {m.get('ssim', 'N/A')}")
+        print(f"── training config ──")
+        print(f"  start_epoch: {self.start_epoch}")
+        print(f"  lr_max: {self.config['lr_max']}")
 
     # ── main training loop ────────────────
     def fit(self):
@@ -238,60 +231,88 @@ class Trainer:
         steps_per_epoch = len(self.train_dl)
         total_steps = total_epochs * steps_per_epoch
 
+        # create OneCycleLR for the full schedule
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=lr_max,
             total_steps=total_steps,
-            pct_start=0.05,
+            pct_start=0.05,           # 5% warmup
             anneal_strategy="cos",
-            div_factor=25,
-            final_div_factor=1e4,
+            div_factor=25,            # initial_lr = max_lr / 25
+            final_div_factor=1e4,     # final_lr = initial_lr / 10000
         )
 
+        # fast-forward scheduler if resuming mid-training
         if self.start_epoch > 0:
             steps_to_skip = self.start_epoch * steps_per_epoch
-            if self.rank == 0:
-                print(f"fast-forwarding scheduler by {steps_to_skip} steps...")
+            print(f"fast-forwarding scheduler by {steps_to_skip} steps "
+                  f"({self.start_epoch} epochs)...")
             for _ in range(steps_to_skip):
                 self.scheduler.step()
 
-        if self.rank == 0:
-            print(f"training: epochs {self.start_epoch}→{total_epochs - 1}")
-            print(f"OneCycleLR: max_lr={lr_max:.1e} | steps/epoch={steps_per_epoch}")
-            print("-" * 60)
+        print(f"training: epochs {self.start_epoch}→{total_epochs - 1} "
+              f"({total_epochs - self.start_epoch} epochs)")
+        print(f"OneCycleLR: max_lr={lr_max:.1e} | steps/epoch={steps_per_epoch} | "
+              f"total_steps={total_steps}")
+        print(f"gradient clipping: max_norm={self.grad_clip}")
+        print("-" * 60)
 
         for epoch in range(self.start_epoch, total_epochs):
             current_lr = self.optimizer.param_groups[0]["lr"]
 
+            if self.is_distributed and hasattr(self.train_dl, "sampler"):
+                sampler = self.train_dl.sampler
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+
             # ── train ──
             t0 = time.time()
-            train_loss = self.train_epoch(epoch)
-            t1 = time.time()
+            train_loss = self.train_epoch()
+            train_time = time.time() - t0
 
-            # ── log & validate (rank 0 only) ──
-            if self.rank == 0:
-                metrics = {"train/loss": train_loss, "train/lr": current_lr}
-                msg = f"[{epoch:03d}/{total_epochs-1:03d}] loss: {train_loss:.4f} | lr: {current_lr:.1e} | time: {t1-t0:.1f}s"
+            # ── validate ──
+            t0 = time.time()
+            metrics = self.validate_benchmark(self.valid_dl, "Set5")
+            val_time = time.time() - t0
 
-                # Validation
-                m = self.validate_benchmark(self.valid_dl, "Set5")
-                msg += f" | psnr: {m['psnr']:.2f} | ssim: {m['ssim']:.4f}"
+            val_psnr = metrics["psnr"]
+            val_ssim = metrics["ssim"]
 
-                metrics["val/Set5_psnr_y"] = m["psnr"]
-                metrics["val/Set5_ssim_y"] = m["ssim"]
+            # ── log to W&B ──
+            if self.is_master:
+                log_dict = {
+                    "train/loss": train_loss,
+                    "train/lr": current_lr,
+                    "val/psnr_y": val_psnr,
+                    "val/ssim_y": val_ssim,
+                    "time/train": train_time,
+                    "time/val": val_time,
+                    "epoch": epoch,
+                }
+                wandb.log(log_dict)
 
-                # Log to wandb
-                wandb.log(metrics)
-                self._log_samples(m["samples"])
+            # log visual samples every epoch
+            if metrics.get("samples"):
+                self._log_samples(metrics["samples"])
 
-                # Checkpoints
-                self.save_checkpoint(epoch, metrics, tag="latest")
-                if m["psnr"] > self.best_psnr:
-                    self.best_psnr = m["psnr"]
-                    self.save_checkpoint(epoch, metrics, tag="best")
-                    msg += " (best)"
+            # ── checkpoint ──
+            is_best = val_psnr > self.best_psnr
+            if is_best:
+                self.best_psnr = val_psnr
+                self.save_checkpoint(epoch, metrics, tag="best")
 
-                print(msg)
-            
-            # Sync all GPUs before next epoch
-            dist.barrier()
+            self.save_checkpoint(epoch, metrics, tag="latest")
+
+            # ── console output ──
+            if self.is_master:
+                best_marker = " <- best" if is_best else ""
+                print(
+                    f"epoch {epoch:4d} | loss {train_loss:.4f} | "
+                    f"PSNR(Y) {val_psnr:.2f}dB | SSIM(Y) {val_ssim:.4f} | "
+                    f"train {train_time:.0f}s | val {val_time:.0f}s | "
+                    f"LR {current_lr:.2e}{best_marker}"
+                )
+
+        if self.is_master:
+            print("-" * 60)
+            print(f"training complete. best PSNR(Y): {self.best_psnr:.2f}dB")
