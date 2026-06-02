@@ -86,6 +86,8 @@ CONFIG = {
     "num_workers": 4,           # dataloader workers
     "weight_decay": 0.01,       # AdamW weight decay
     "grad_clip": 1.0,           # gradient clipping max norm
+    "warmup_epochs": 8,         # linear warmup epochs
+    "min_lr": 1e-7,             # cosine decay target
     "use_checkpoint": True,     # saves massive VRAM at the cost of ~20% compute time
     "log_interval_steps": 0,    # batch log interval (0 = epoch-only)
 
