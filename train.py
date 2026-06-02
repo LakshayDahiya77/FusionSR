@@ -171,6 +171,9 @@ def _train_worker(rank: int, world_size: int, config_file: str):
         oca_overlap=config["oca_overlap"],
         use_checkpoint=config.get("use_checkpoint", False),
     ).to(device)
+    
+    # Force channels_last for tensorcore performance before DDP setup
+    model = model.to(memory_format=torch.channels_last)
 
     if rank == 0:
         print(f"parameters: {count_parameters(model) / 1e6:.2f}M")

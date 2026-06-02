@@ -85,11 +85,11 @@ class Trainer:
         for step, batch in enumerate(self.train_dl, start=1):
             if isinstance(batch, (list, tuple)) and len(batch) == 2:
                 lr_imgs, hr_imgs = batch
-                lr_imgs = lr_imgs.to(self.device, non_blocking=True)
-                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+                lr_imgs = lr_imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
             else:
                 hr_imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
-                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
                 lr_imgs = generate_lr_on_gpu(hr_imgs, scale=self.config["scale"])
             lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
 
@@ -145,8 +145,8 @@ class Trainer:
         scale = self.config["scale"]
 
         for i, (lr_imgs, hr_imgs, fname) in enumerate(benchmark_dl):
-            lr_imgs = lr_imgs.to(self.device)
-            hr_imgs = hr_imgs.to(self.device).float()
+            lr_imgs = lr_imgs.to(self.device, memory_format=torch.channels_last)
+            hr_imgs = hr_imgs.to(self.device, memory_format=torch.channels_last).float()
 
             with torch.autocast("cuda", dtype=self.amp_dtype):
                 pred = model(lr_imgs).float().clamp(0, 1)

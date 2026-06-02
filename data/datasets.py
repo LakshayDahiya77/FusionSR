@@ -42,7 +42,7 @@ def gpu_augment(lr: torch.Tensor, hr: torch.Tensor):
         lr = torch.rot90(lr, k, dims=[-2, -1])
         hr = torch.rot90(hr, k, dims=[-2, -1])
 
-    return lr, hr
+    return lr.contiguous(), hr.contiguous()
 
 
 # ─────────────────────────────────────────
