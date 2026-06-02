@@ -80,8 +80,9 @@ class Trainer:
         """Run one training epoch. Returns average loss."""
         self.model.train()
         total_loss = 0.0
+        log_interval = int(self.config.get("log_interval_steps", 0) or 0)
 
-        for lr_imgs, hr_imgs in self.train_dl:
+        for step, (lr_imgs, hr_imgs) in enumerate(self.train_dl, start=1):
             lr_imgs = lr_imgs.to(self.device, non_blocking=True)
             hr_imgs = hr_imgs.to(self.device, non_blocking=True)
             lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
@@ -108,6 +109,13 @@ class Trainer:
                 self.scheduler.step()
 
             total_loss += loss.item()
+
+            if log_interval > 0 and self.is_master and step % log_interval == 0:
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                print(
+                    f"  step {step:5d}/{len(self.train_dl)} | "
+                    f"loss {loss.item():.4f} | lr {current_lr:.2e}"
+                )
 
         avg_loss = total_loss / len(self.train_dl)
         return self._all_reduce_mean(avg_loss)

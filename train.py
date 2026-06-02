@@ -87,6 +87,7 @@ CONFIG = {
     "weight_decay": 0.01,       # AdamW weight decay
     "grad_clip": 1.0,           # gradient clipping max norm
     "use_checkpoint": True,     # saves massive VRAM at the cost of ~20% compute time
+    "log_interval_steps": 0,    # batch log interval (0 = epoch-only)
 
     # ── data paths (set in notebook cell) ──
     "train_hr_dirs": [],        # list of HR image directories
