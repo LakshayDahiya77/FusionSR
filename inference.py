@@ -16,7 +16,7 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 from models.fusionsr import FusionSR
 
-MODEL_CONFIG = {
+V2_CONFIG = {
     "in_channels": 3,
     "out_channels": 3,
     "channels": 96,
@@ -28,7 +28,24 @@ MODEL_CONFIG = {
     "ffn_expansion": 2.0,
 }
 
-def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
+V4_CONFIG = {
+    "in_channels": 3,
+    "out_channels": 3,
+    "channels": 180,
+    "num_groups": 6,
+    "num_rcab": 6,
+    "window_size": 16,
+    "num_heads": 6,
+    "scale": 4,
+    "ffn_expansion": 2.0,
+    "oca_overlap": 4,
+}
+
+def load_model(
+    model_identifier: str,
+    device: torch.device,
+    model_config: dict,
+) -> torch.nn.Module:
     """Loads from HF Hub if given 'classical'/'satellite', else treats as local path."""
     if model_identifier in ["classical", "satellite"]:
         filename = f"fusionsr-v2-{model_identifier}.pt"
@@ -42,7 +59,7 @@ def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
         print(f"loaded local checkpoint from {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = FusionSR(**MODEL_CONFIG).to(device)
+    model = FusionSR(**model_config).to(device)
     model.load_state_dict(ckpt.get("model", ckpt))
     model.eval()
     return model
@@ -74,10 +91,25 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
+    if args.checkpoint:
+        ckpt_path = args.checkpoint
+    elif args.model:
+        ckpt_path = args.model
+    else:
+        raise ValueError("Specify --checkpoint or --model")
+
+    if args.version == "v4" and args.model in ["classical", "satellite"]:
+        raise ValueError("HF 'classical'/'satellite' checkpoints are v2; use --version v2 or a v4 checkpoint")
+
+    if args.version == "v2" or (args.version is None and args.model in ["classical", "satellite"]):
+        model_config = V2_CONFIG
+    else:
+        model_config = V4_CONFIG
+
     # load model
     print(f"loading checkpoint: {ckpt_path}")
-    model = load_model(ckpt_path, device)
-    print(f"model loaded — scale: {MODEL_CONFIG['scale']}×")
+    model = load_model(ckpt_path, device, model_config)
+    print(f"model loaded — scale: {model_config['scale']}×")
 
     # load input image
     input_path = Path(args.input)
@@ -99,7 +131,7 @@ def main(args):
         model,
         img_tensor,
         device,
-        scale=MODEL_CONFIG["scale"],
+        scale=model_config["scale"],
     )
 
     # convert back to PIL and save
@@ -135,6 +167,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="local checkpoint path (overrides --model)",
+    )
+    parser.add_argument(
+        "--version",
+        type=str,
+        choices=["v2", "v4"],
+        default=None,
+        help="model version to use (defaults: v2 for HF models, v4 otherwise)",
     )
     args = parser.parse_args()
     main(args)

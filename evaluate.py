@@ -34,7 +34,7 @@ DIOR_BASE = (
     "/kaggle/input/datasets/redzapdos123/dior-r-dataset-yolov11-obb-format/YOLODIOR-R"
 )
 
-MODEL_CONFIG = {
+V2_CONFIG = {
     "in_channels": 3,
     "out_channels": 3,
     "channels": 96,
@@ -43,6 +43,19 @@ MODEL_CONFIG = {
     "window_size": 8,
     "num_heads": 4,
     "scale": 4,
+}
+
+V4_CONFIG = {
+    "in_channels": 3,
+    "out_channels": 3,
+    "channels": 180,
+    "num_groups": 6,
+    "num_rcab": 6,
+    "window_size": 16,
+    "num_heads": 6,
+    "scale": 4,
+    "ffn_expansion": 2.0,
+    "oca_overlap": 4,
 }
 
 CLASSICAL_BENCHMARKS = {
@@ -110,7 +123,7 @@ class HROnlyDataset(Dataset):
         hr = torch.from_numpy(
             np.array(Image.open(hr_path).convert("RGB"), dtype=np.float32) / 255.0
         ).permute(2, 0, 1)
-        
+
         # ── FIXED: Modulo Crop (ensure HR is divisible by scale) ──
         _, h, w = hr.shape
         crop_h = h - (h % self.scale)
@@ -121,7 +134,7 @@ class HROnlyDataset(Dataset):
         lr = (
             F.interpolate(
                 hr.unsqueeze(0),
-                size=(crop_h // self.scale, crop_w // self.scale), # Use exact size instead of scale_factor
+                size=(crop_h // self.scale, crop_w // self.scale),
                 mode="bicubic",
                 align_corners=False,
                 antialias=True,
@@ -134,7 +147,11 @@ class HROnlyDataset(Dataset):
 # ─────────────────────────────────────────
 #  Model loader
 # ─────────────────────────────────────────
-def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
+def load_model(
+    model_identifier: str,
+    device: torch.device,
+    model_config: dict,
+) -> torch.nn.Module:
     """Loads from HF Hub if given 'classical'/'satellite', else treats as local path."""
     if model_identifier in ["classical", "satellite"]:
         filename = f"fusionsr-v2-{model_identifier}.pt"
@@ -148,7 +165,7 @@ def load_model(model_identifier: str, device: torch.device) -> torch.nn.Module:
         print(f"loaded local checkpoint from {ckpt_path}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = FusionSR(**MODEL_CONFIG).to(device)
+    model = FusionSR(**model_config).to(device)
     model.load_state_dict(ckpt.get("model", ckpt))
     model.eval()
     return model
@@ -195,6 +212,7 @@ def evaluate_dataset(
     mode: str,  # "paired" | "hr_only"
     device: torch.device,
     scale: int = 4,
+    window_size: int = 8,
     save_samples: bool = True,
     sample_dir: str = "results/samples",
     n_samples: int = 3,
@@ -220,7 +238,7 @@ def evaluate_dataset(
         lr_imgs = lr_imgs.to(device).float()
 
         # model prediction
-        pred = run_model(model, lr_imgs, device)
+        pred = run_model(model, lr_imgs, device, window_size=window_size)
 
         # bicubic baseline
         bic = bicubic_upsample(lr_imgs, scale=scale)
@@ -338,6 +356,27 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
+    try:
+        from kaggle_secrets import UserSecretsClient
+
+        secrets = UserSecretsClient()
+        wandb.login(key=secrets.get_secret("WANDB_API_KEY"))
+    except Exception:
+        try:
+            wandb.login()
+        except Exception:
+            pass
+
+    def resolve_config(default_version: str, checkpoint: str | None) -> dict:
+        version = args.version or default_version
+        if version == "v4" and checkpoint in ("classical", "satellite"):
+            raise ValueError("HF 'classical'/'satellite' checkpoints are v2; use --version v2 or a v4 checkpoint")
+        if version == "v2":
+            return V2_CONFIG
+        if version == "v4":
+            return V4_CONFIG
+        raise ValueError("--version must be 'v2' or 'v4'")
+
 
     models_to_eval = []
 
@@ -345,16 +384,28 @@ def main(args):
         # If no local checkpoint provided, pass "classical" to trigger HF download
         ckpt = args.classical_checkpoint or "classical"
         print(f"\nloading FusionSR-v2-Classical...")
-        m = load_model(ckpt, device)
-        models_to_eval.append(("FusionSR-v2-Classical", m, CLASSICAL_BENCHMARKS))
+        model_config = resolve_config("v2", ckpt)
+        m = load_model(ckpt, device, model_config)
+        models_to_eval.append((
+            f"FusionSR-{args.version or 'v2'}-Classical",
+            m,
+            CLASSICAL_BENCHMARKS,
+            model_config,
+        ))
 
     if args.model in ("satellite", "both"):
         ckpt = args.satellite_checkpoint or "satellite"
         print(f"\nloading FusionSR-v2-Satellite...")
-        m = load_model(ckpt, device)
-        models_to_eval.append(("FusionSR-v2-Satellite", m, SATELLITE_BENCHMARKS))
+        model_config = resolve_config("v2", ckpt)
+        m = load_model(ckpt, device, model_config)
+        models_to_eval.append((
+            f"FusionSR-{args.version or 'v2'}-Satellite",
+            m,
+            SATELLITE_BENCHMARKS,
+            model_config,
+        ))
 
-    for model_name, model, benchmarks in models_to_eval:
+    for model_name, model, benchmarks, model_config in models_to_eval:
         print(f"\n{'═'*50}")
         print(f"evaluating {model_name}")
         print(f"{'═'*50}")
@@ -369,6 +420,8 @@ def main(args):
                 lr_dir=lr_dir,
                 mode=mode,
                 device=device,
+                scale=model_config["scale"],
+                window_size=model_config["window_size"],
                 save_samples=True,
                 sample_dir=f"results/samples/{model_name}",
             )
@@ -388,5 +441,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--classical_checkpoint", type=str, default=None)
     parser.add_argument("--satellite_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--version",
+        type=str,
+        choices=["v2", "v4"],
+        default=None,
+        help="model version (defaults to v2 for HF models)",
+    )
     args = parser.parse_args()
     main(args)

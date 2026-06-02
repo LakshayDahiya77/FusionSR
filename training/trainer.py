@@ -13,7 +13,7 @@ import torch.distributed as dist
 import wandb
 
 from utils.metrics import psnr_y, ssim_y
-from data.datasets import gpu_augment
+from data.datasets import gpu_augment, generate_lr_on_gpu
 
 
 class Trainer:
@@ -82,9 +82,15 @@ class Trainer:
         total_loss = 0.0
         log_interval = int(self.config.get("log_interval_steps", 0) or 0)
 
-        for step, (lr_imgs, hr_imgs) in enumerate(self.train_dl, start=1):
-            lr_imgs = lr_imgs.to(self.device, non_blocking=True)
-            hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+        for step, batch in enumerate(self.train_dl, start=1):
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                lr_imgs, hr_imgs = batch
+                lr_imgs = lr_imgs.to(self.device, non_blocking=True)
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+            else:
+                hr_imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
+                hr_imgs = hr_imgs.to(self.device, non_blocking=True)
+                lr_imgs = generate_lr_on_gpu(hr_imgs, scale=self.config["scale"])
             lr_imgs, hr_imgs = gpu_augment(lr_imgs, hr_imgs)
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -177,15 +183,15 @@ class Trainer:
             return
         panels = []
         for s in samples:
+            h, w = s["hr"].shape[-2], s["hr"].shape[-1]
             lr_up = (
                 torch.nn.functional.interpolate(
-                    s["lr"].unsqueeze(0), scale_factor=4,
+                    s["lr"].unsqueeze(0), size=(h, w),
                     mode="bicubic", align_corners=False,
                 )
                 .squeeze(0)
                 .clamp(0, 1)
             )
-            h, w = s["hr"].shape[-2], s["hr"].shape[-1]
             lr_up = lr_up[:, :h, :w]
             sr = s["sr"][:, :h, :w]
             comparison = torch.cat([lr_up, sr, s["hr"]], dim=2)
@@ -246,6 +252,9 @@ class Trainer:
         steps_per_epoch = len(self.train_dl)
         total_steps = total_epochs * steps_per_epoch
 
+        for group in self.optimizer.param_groups:
+            group.setdefault("initial_lr", lr_max)
+
         # create OneCycleLR for the full schedule
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
@@ -255,16 +264,8 @@ class Trainer:
             anneal_strategy="cos",
             div_factor=25,            # initial_lr = max_lr / 25
             final_div_factor=1e4,     # final_lr = initial_lr / 10000
+            last_epoch=self.start_epoch * steps_per_epoch - 1,
         )
-
-        # fast-forward scheduler if resuming mid-training
-        if self.start_epoch > 0:
-            steps_to_skip = self.start_epoch * steps_per_epoch
-            if self.is_master:
-                print(f"fast-forwarding scheduler by {steps_to_skip} steps "
-                      f"({self.start_epoch} epochs)...")
-            for _ in range(steps_to_skip):
-                self.scheduler.step()
 
         if self.is_master:
             print(f"training: epochs {self.start_epoch}→{total_epochs - 1} "

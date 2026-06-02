@@ -3,7 +3,7 @@ FusionSR-v4 datasets.
 
 Datasets:
     PairedSRDataset  — pre-computed LR+HR pairs (DIV2K, Flickr2K)
-    HROnlyDataset    — HR-only, generates LR on-the-fly (LSDIR)
+    HROnlyDataset    — HR-only (LSDIR); LR generated on GPU in trainer
     BenchmarkDataset — Set5/Set14 evaluation
 """
 
@@ -150,17 +150,7 @@ class HROnlyDataset(Dataset):
         hr_np = self._random_crop_hr(hr_np)
 
         hr = torch.from_numpy(hr_np.copy()).permute(2, 0, 1).float().div_(255.0)
-
-        # generate LR via bicubic downscale
-        lr = F.interpolate(
-            hr.unsqueeze(0),
-            scale_factor=1.0 / self.scale,
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        ).squeeze(0).clamp(0, 1)
-
-        return lr, hr
+        return hr
 
     def _random_crop_hr(self, hr: np.ndarray) -> np.ndarray:
         """Random crop at HR resolution [H, W, 3]."""
@@ -276,6 +266,21 @@ def make_benchmark_dl(hr_dir: str, lr_dir: str) -> DataLoader:
     """Set5 / Set14 benchmark dataloader."""
     ds = BenchmarkDataset(hr_dir, lr_dir)
     return DataLoader(ds, batch_size=1, shuffle=False, num_workers=2)
+
+
+def generate_lr_on_gpu(hr: torch.Tensor, scale: int = 4) -> torch.Tensor:
+    """
+    Generate LR from HR via bicubic downscaling on GPU.
+    hr: [B, 3, H, W] on CUDA
+    returns: [B, 3, H//scale, W//scale] on CUDA
+    """
+    return F.interpolate(
+        hr,
+        scale_factor=1.0 / scale,
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    ).clamp(0, 1)
 
 
 def generate_lr_on_gpu(hr: torch.Tensor, scale: int = 4) -> torch.Tensor:
