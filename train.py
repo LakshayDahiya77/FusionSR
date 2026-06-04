@@ -68,21 +68,21 @@ _ensure_project_on_path()
 
 CONFIG = {
     # ── model architecture ──
-    "channels": 180,
+    "channels": 128,
     "num_groups": 6,
     "num_rcab": 6,
     "window_size": 16,
-    "num_heads": 6,
+    "num_heads": 4,
     "scale": 4,
     "ffn_expansion": 2.0,
-    "oca_overlap": 4,
+    "oca_overlap": 2,
 
     # ── training ──
     "total_epochs": 150,        # OneCycleLR schedule length
     "start_epoch": 0,           # resume from this epoch
-    "lr_max": 3e-4,             # OneCycleLR peak LR
+    "lr_max": 2e-4,             # OneCycleLR peak LR
     "batch_size": 16,           # adjust based on GPU VRAM
-    "patch_lr": 128,            # LR patch size (HR = 512)
+    "patch_lr": 64,             # LR patch size (HR = 512)
     "num_workers": 4,           # dataloader workers
     "weight_decay": 0.01,       # AdamW weight decay
     "grad_clip": 1.0,           # gradient clipping max norm
@@ -99,8 +99,8 @@ CONFIG = {
 
     # ── W&B ──
     "wandb_entity": "lakshay_dahiya77",
-    "wandb_project": "FusionSR-v4",
-    "wandb_run": "v4-phase1",
+    "wandb_project": "FusionSR-v4-light",
+    "wandb_run": "v4-light-phase1",
     "wandb_run_id": None,       # set to resume same W&B run
 
     # ── resume ──
