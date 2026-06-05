@@ -18,34 +18,32 @@ from data.datasets import make_train_dl, make_benchmark_dl, generate_lr_on_gpu
 #  UNIFIED DATASET STORAGE PIPELINE (RAM-SAFE)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import io
+
 class UnifiedHRDataset(Dataset):
-    """Memory-safe dataset class for streaming massive HR-only folders with precise count filtering."""
-    def __init__(self, root_dir, patch_size=128, scale=4, filters=None):
+    def __init__(self, root_dir, patch_size=128, scale=4, filters=None, preload_to_ram=False):
         self.root_dir = root_dir
         self.patch_size = patch_size
         self.scale = scale
         self.patch_hr = patch_size * scale
+        self.preload_to_ram = preload_to_ram
         
         raw_paths = []
         for ext in ("*.jpg", "*.jpeg", "*.png"):
             raw_paths.extend(glob.glob(os.path.join(root_dir, '**', ext), recursive=True))
             raw_paths.extend(glob.glob(os.path.join(root_dir, '**', ext.upper()), recursive=True))
         
-        # Apply Dictionary-based Filtering with Limits
         if filters and isinstance(filters, dict):
             filtered_paths = []
             for filter_str, max_limit in filters.items():
                 f_lower = filter_str.lower()
-                # Find all matching files and sort them deterministically
                 matches = sorted([p for p in raw_paths if f_lower in os.path.basename(p).lower()])
                 
-                # Apply the specific cutoff limit if one is provided
                 if max_limit is not None:
                     matches = matches[:max_limit]
                     
                 filtered_paths.extend(matches)
             
-            # Remove potential duplicates while preserving order
             self.img_paths = list(dict.fromkeys(filtered_paths))
         else:
             self.img_paths = sorted(list(set(raw_paths)))
@@ -55,33 +53,45 @@ class UnifiedHRDataset(Dataset):
         else:
             print(f"UnifiedHRDataset initialized with {len(self.img_paths)} total images.")
 
+        self.ram_cache = []
+        if self.preload_to_ram:
+            print("Preloading dataset into System RAM...")
+            for p in self.img_paths:
+                with open(p, 'rb') as f:
+                    self.ram_cache.append(f.read())
+            print("Preloading complete.")
+
     def __len__(self):
         return len(self.img_paths)
 
     def __getitem__(self, idx):
-        path = self.img_paths[idx]
         try:
-            with Image.open(path) as img:
-                img = img.convert("RGB")
-                w, h = img.size
-                
-                if w < self.patch_hr or h < self.patch_hr:
-                    img = img.resize((max(w, self.patch_hr), max(h, self.patch_hr)), Image.BICUBIC)
-                    w, h = img.size
+            if self.preload_to_ram and len(self.ram_cache) > 0:
+                img_bytes = self.ram_cache[idx]
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            else:
+                path = self.img_paths[idx]
+                img = Image.open(path).convert("RGB")
 
-                x0 = random.randint(0, w - self.patch_hr)
-                y0 = random.randint(0, h - self.patch_hr)
-                cropped_img = img.crop((x0, y0, x0 + self.patch_hr, y0 + self.patch_hr))
-                
-                if random.random() > 0.5:
-                    cropped_img = cropped_img.transpose(Image.FLIP_LEFT_RIGHT)
-                rot = random.choice([0, 90, 180, 270])
-                if rot != 0:
-                    cropped_img = cropped_img.rotate(rot)
-                
-                hr_tensor = torch.from_numpy(np.array(cropped_img, dtype=np.uint8, copy=True))
-                hr_tensor = hr_tensor.permute(2, 0, 1).float() / 255.0
-                return hr_tensor
+            w, h = img.size
+            
+            if w < self.patch_hr or h < self.patch_hr:
+                img = img.resize((max(w, self.patch_hr), max(h, self.patch_hr)), Image.BICUBIC)
+                w, h = img.size
+
+            x0 = random.randint(0, w - self.patch_hr)
+            y0 = random.randint(0, h - self.patch_hr)
+            cropped_img = img.crop((x0, y0, x0 + self.patch_hr, y0 + self.patch_hr))
+            
+            if random.random() > 0.5:
+                cropped_img = cropped_img.transpose(Image.FLIP_LEFT_RIGHT)
+            rot = random.choice([0, 90, 180, 270])
+            if rot != 0:
+                cropped_img = cropped_img.rotate(rot)
+            
+            hr_tensor = torch.from_numpy(np.array(cropped_img, dtype=np.uint8, copy=True))
+            hr_tensor = hr_tensor.permute(2, 0, 1).float() / 255.0
+            return hr_tensor
         except Exception as e:
             return self.__getitem__(random.randint(0, len(self.img_paths) - 1))
 
@@ -184,7 +194,8 @@ def main():
             root_dir=config["unified_hr_dir"],
             patch_size=config["patch_lr"],
             scale=config["scale"],
-            filters=config.get("unified_filters", None) 
+            filters=config.get("unified_filters", None),
+            preload_to_ram=config.get("preload_to_ram", False)
         )
         train_dl = DataLoader(
             train_ds,
