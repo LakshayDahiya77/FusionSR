@@ -218,7 +218,7 @@ def main():
         num_groups=config["num_groups"],
         num_rcab=config["num_rcab"],
         window_size=config["window_size"],
-        num_where=config["num_heads"],
+        num_heads=config["num_heads"],
         scale=config["scale"],
         ffn_expansion=config["ffn_expansion"],
         oca_overlap=config["oca_overlap"],
