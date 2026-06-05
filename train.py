@@ -183,7 +183,8 @@ def main():
         train_ds = UnifiedHRDataset(
             root_dir=config["unified_hr_dir"],
             patch_size=config["patch_lr"],
-            scale=config["scale"]
+            scale=config["scale"],
+            filters=config.get("unified_filters", None) 
         )
         train_dl = DataLoader(
             train_ds,
