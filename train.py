@@ -249,7 +249,8 @@ def main():
     # Intercepting training iterations for HR-only batches to step generation on GPU
     if config.get("use_unified_dataset", False):
         class UnifiedStepTrainer(Trainer):
-            def train_epoch(self, epoch):
+            # FIXED: Removed 'epoch' from the arguments
+            def train_epoch(self): 
                 # Custom processing loop wrapper that generates LR targets on GPU dynamically
                 self.model.train()
                 epoch_loss = 0.0
@@ -258,8 +259,11 @@ def main():
                     lr_tensors = generate_lr_on_gpu(hr_tensors, scale=self.config["scale"])
                     
                     self.optimizer.zero_grad(set_to_none=True)
-                    pred = self.model(lr_tensors)
-                    loss, loss_dict = self.loss_fn(pred, hr_tensors)
+                    
+                    with torch.autocast("cuda", dtype=torch.bfloat16): # Added autocast for speed
+                        pred = self.model(lr_tensors)
+                        loss, loss_dict = self.loss_fn(pred, hr_tensors)
+                        
                     loss.backward()
                     
                     if self.config["grad_clip"] > 0:
@@ -271,15 +275,10 @@ def main():
                         self.ema_model.update_parameters(self.model)
                         
                     epoch_loss += loss.item()
+                    
                 return epoch_loss / len(self.train_dl)
         
         trainer = UnifiedStepTrainer(
-            model=model, loss_fn=loss_fn, optimizer=optimizer,
-            train_dl=train_dl, valid_dl=valid_dl, config=config,
-            device=device, save_dir=config["save_dir"]
-        )
-    else:
-        trainer = Trainer(
             model=model, loss_fn=loss_fn, optimizer=optimizer,
             train_dl=train_dl, valid_dl=valid_dl, config=config,
             device=device, save_dir=config["save_dir"]
