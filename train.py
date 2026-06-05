@@ -1,49 +1,84 @@
-"""
-FusionSR-v4 training entry point.
-
-Usage (Colab notebook cell):
-
-    import train
-
-    train.CONFIG.update({
-        # Data paths (set after downloading/unzipping)
-        'train_hr_dirs': ['/content/DIV2K_train_HR', '/content/Flickr2K_HR'],
-        'train_lr_dirs': ['/content/DIV2K_train_LR_bicubic/X4', '/content/Flickr2K_LR_bicubic/X4'],
-        'val_hr_dir': '/content/Set5/GTmod12',
-        'val_lr_dir': '/content/Set5/LRbicx4',
-
-        # Training
-        'total_epochs': 150,
-        'start_epoch': 0,
-        'lr_max': 3e-4,
-        'batch_size': 16,
-        'patch_lr': 128,
-
-        # W&B
-        'wandb_run': 'v4-phase1',
-    })
-
-    train.main()
-"""
-
 import os
 import copy
 import glob
 import torch
 import wandb
+import random
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from models.fusionsr import FusionSR, count_parameters
 from models.losses import CombinedSRLoss
 from training.trainer import Trainer
-from data.datasets import make_train_dl, make_benchmark_dl
+from data.datasets import make_train_dl, make_benchmark_dl, generate_lr_on_gpu
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG — override in notebook cell before calling main()
+#  UNIFIED DATASET STORAGE PIPELINE (RAM-SAFE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UnifiedHRDataset(Dataset):
+    """Memory-safe dataset class for streaming massive HR-only folders."""
+    def __init__(self, root_dir, patch_size=128, scale=4):
+        self.root_dir = root_dir
+        self.patch_size = patch_size
+        self.scale = scale
+        self.patch_hr = patch_size * scale
+        
+        # Collect all images matching common extensions
+        self.img_paths = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.png"):
+            self.img_paths.extend(glob.glob(os.path.join(root_dir, ext)))
+            self.img_paths.extend(glob.glob(os.path.join(root_dir, ext.upper())))
+        
+        self.img_paths = sorted(list(set(self.img_paths)))
+        if len(self.img_paths) == 0:
+            raise RuntimeError(f"No images found in unified directory: {root_dir}")
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        path = self.img_paths[idx]
+        try:
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                w, h = img.size
+                
+                # Guard against rare ultra-small source images
+                if w < self.patch_hr or h < self.patch_hr:
+                    # Fallback to center resizing if smaller than patch requirement
+                    img = img.resize((max(w, self.patch_hr), max(h, self.patch_hr)), Image.BICUBIC)
+                    w, h = img.size
+
+                # Storage-safe parsing: crop region BEFORE loading whole image arrays into RAM
+                x0 = random.randint(0, w - self.patch_hr)
+                y0 = random.randint(0, h - self.patch_hr)
+                cropped_img = img.crop((x0, y0, x0 + self.patch_hr, y0 + self.patch_hr))
+                
+                # Data augmentation
+                if random.random() > 0.5:
+                    cropped_img = cropped_img.transpose(Image.FLIP_LEFT_RIGHT)
+                rot = random.choice([0, 90, 180, 270])
+                if rot != 0:
+                    cropped_img = cropped_img.rotate(rot)
+                
+                hr_tensor = torch.from_numpy(
+                    copy.deepcopy(torch.ByteStorage.from_buffer(cropped_img.tobytes()).numpy())
+                ).view(self.patch_hr, self.patch_hr, 3)
+                hr_tensor = hr_tensor.permute(2, 0, 1).float() / 255.0
+                return hr_tensor
+        except Exception as e:
+            # Fallback to index 0 on corrupted images to safeguard long training runs
+            return self.__getitem__(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 CONFIG = {
-    # ── model architecture ──
     "channels": 180,
     "num_groups": 6,
     "num_rcab": 6,
@@ -52,49 +87,48 @@ CONFIG = {
     "scale": 4,
     "ffn_expansion": 2.0,
     "oca_overlap": 4,
-
-    # ── training ──
-    "total_epochs": 150,        # OneCycleLR schedule length
-    "start_epoch": 0,           # resume from this epoch
-    "lr_max": 3e-4,             # OneCycleLR peak LR
-    "batch_size": 16,           # adjust based on GPU VRAM
-    "patch_lr": 128,            # LR patch size (HR = 512)
-    "num_workers": 4,           # dataloader workers
-    "weight_decay": 0.01,       # AdamW weight decay
-    "grad_clip": 1.0,           # gradient clipping max norm
-    "warmup_epochs": 8,         # linear warmup epochs
-    "min_lr": 1e-7,             # cosine decay target
-    "allow_tf32": True,         # enable TF32 on Ampere+ for faster matmul/conv
-    "matmul_precision": "high", # torch.set_float32_matmul_precision
-    "use_compile": False,       # torch.compile (PyTorch 2.x)
+    "total_epochs": 150,
+    "start_epoch": 0,
+    "lr_max": 3e-4,
+    "batch_size": 16,
+    "patch_lr": 128,
+    "num_workers": 4,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "warmup_epochs": 8,
+    "min_lr": 1e-7,
+    "allow_tf32": True,
+    "matmul_precision": "high",
+    "use_compile": False,
     "compile_mode": "max-autotune",
     "compile_fullgraph": False,
     "compile_dynamic": False,
-
-    # ── data paths (set in notebook cell) ──
-    "train_hr_dirs": [],        # list of HR image directories
-    "train_lr_dirs": [],        # list of LR directories (empty = generate on-the-fly)
-    "val_hr_dir": "",           # Set5 GTmod12 path
-    "val_lr_dir": "",           # Set5 LRbicx4 path
-
-    # ── W&B ──
+    
+    # EMA settings
+    "use_ema": False,
+    "ema_decay": 0.999,
+    
+    # Dataset routing toggles
+    "use_unified_dataset": False,
+    "unified_hr_dir": "",
+    
+    # Traditional split fallbacks
+    "train_hr_dirs": [],
+    "train_lr_dirs": [],
+    "val_hr_dir": "",
+    "val_lr_dir": "",
+    
     "wandb_entity": "lakshay_dahiya77",
     "wandb_project": "FusionSR-v4",
     "wandb_run": "v4-phase1",
-    "wandb_run_id": None,       # set to resume same W&B run
-
-    # ── resume ──
-    "resume": None,             # W&B artifact name or local .pt path
-
-    # ── paths ──
+    "wandb_run_id": None,
+    "resume": None,
     "save_dir": "/content/checkpoints",
 }
 
 
 def main():
-    """Single-GPU training entry point."""
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
@@ -108,15 +142,12 @@ def main():
     if matmul_precision:
         torch.set_float32_matmul_precision(matmul_precision)
 
-    # ── GPU info ──
     print(f"\ndevice: {device}")
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(device)
         print(f"GPU: {props.name} ({props.total_memory / 1024**3:.1f}GB)")
 
-    # ── W&B ──
     wandb.login()
-
     wandb_kwargs = {
         "entity": config["wandb_entity"],
         "project": config["wandb_project"],
@@ -131,19 +162,35 @@ def main():
     run = wandb.init(**wandb_kwargs)
     print(f"W&B run ID: {run.id}\n")
 
-    # ── dataloaders ──
-    assert config["train_hr_dirs"], "Set CONFIG['train_hr_dirs'] to a list of HR directories"
-    assert config["val_hr_dir"], "Set CONFIG['val_hr_dir'] to Set5 GTmod12 path"
-    assert config["val_lr_dir"], "Set CONFIG['val_lr_dir'] to Set5 LRbicx4 path"
+    assert config["val_hr_dir"], "Validation paths are mandatory."
+    assert config["val_lr_dir"], "Validation paths are mandatory."
 
-    train_dl = make_train_dl(
-        hr_dirs=config["train_hr_dirs"],
-        lr_dirs=config["train_lr_dirs"] or None,
-        patch_lr=config["patch_lr"],
-        batch_size=config["batch_size"],
-        num_workers=config["num_workers"],
-        scale=config["scale"],
-    )
+    # Routing Dataloaders via flag
+    if config.get("use_unified_dataset", False):
+        print(f"Initializing Unified Storage-backed stream from: {config['unified_hr_dir']}")
+        train_ds = UnifiedHRDataset(
+            root_dir=config["unified_hr_dir"],
+            patch_size=config["patch_lr"],
+            scale=config["scale"]
+        )
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=config["batch_size"],
+            shuffle=True,
+            num_workers=config["num_workers"],
+            pin_memory=True,
+            drop_last=True
+        )
+    else:
+        assert config["train_hr_dirs"], "Legacy mode requires valid train_hr_dirs"
+        train_dl = make_train_dl(
+            hr_dirs=config["train_hr_dirs"],
+            lr_dirs=config["train_lr_dirs"] or None,
+            patch_lr=config["patch_lr"],
+            batch_size=config["batch_size"],
+            num_workers=config["num_workers"],
+            scale=config["scale"],
+        )
 
     valid_dl = make_benchmark_dl(
         hr_dir=config["val_hr_dir"],
@@ -152,13 +199,12 @@ def main():
 
     print(f"train batches: {len(train_dl)} | valid images: {len(valid_dl)}")
 
-    # ── model ──
     model = FusionSR(
         channels=config["channels"],
         num_groups=config["num_groups"],
         num_rcab=config["num_rcab"],
         window_size=config["window_size"],
-        num_heads=config["num_heads"],
+        num_where=config["num_heads"],
         scale=config["scale"],
         ffn_expansion=config["ffn_expansion"],
         oca_overlap=config["oca_overlap"],
@@ -174,10 +220,11 @@ def main():
 
     print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
-    # ── loss ──
-    loss_fn = CombinedSRLoss(pixel_weight=1.0, use_perceptual=False).to(device)
+    ema_model = None
+    if config.get("use_ema", False):
+        ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(config["ema_decay"]))
 
-    # ── optimizer ──
+    loss_fn = CombinedSRLoss(pixel_weight=1.0, use_perceptual=False).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["lr_max"],
@@ -185,48 +232,71 @@ def main():
         betas=(0.9, 0.999),
     )
 
-    # ── trainer ──
-    trainer = Trainer(
-        model=model,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        train_dl=train_dl,
-        valid_dl=valid_dl,
-        config=config,
-        device=device,
-        save_dir=config["save_dir"],
-    )
+    # Intercepting training iterations for HR-only batches to step generation on GPU
+    if config.get("use_unified_dataset", False):
+        class UnifiedStepTrainer(Trainer):
+            def train_epoch(self, epoch):
+                # Custom processing loop wrapper that generates LR targets on GPU dynamically
+                self.model.train()
+                epoch_loss = 0.0
+                for batch_idx, hr_tensors in enumerate(self.train_dl):
+                    hr_tensors = hr_tensors.to(self.device, non_blocking=True)
+                    lr_tensors = generate_lr_on_gpu(hr_tensors, scale=self.config["scale"])
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    pred = self.model(lr_tensors)
+                    loss, loss_dict = self.loss_fn(pred, hr_tensors)
+                    loss.backward()
+                    
+                    if self.config["grad_clip"] > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config["grad_clip"])
+                    
+                    self.optimizer.step()
+                    
+                    if hasattr(self, "ema_model") and self.ema_model is not None:
+                        self.ema_model.update_parameters(self.model)
+                        
+                    epoch_loss += loss.item()
+                return epoch_loss / len(self.train_dl)
+        
+        trainer = UnifiedStepTrainer(
+            model=model, loss_fn=loss_fn, optimizer=optimizer,
+            train_dl=train_dl, valid_dl=valid_dl, config=config,
+            device=device, save_dir=config["save_dir"]
+        )
+    else:
+        trainer = Trainer(
+            model=model, loss_fn=loss_fn, optimizer=optimizer,
+            train_dl=train_dl, valid_dl=valid_dl, config=config,
+            device=device, save_dir=config["save_dir"]
+        )
 
-    # ── resume ──
+    if ema_model is not None:
+        trainer.ema_model = ema_model
+
     if config["resume"]:
         resume_path = config["resume"]
-
         if "/" in resume_path:
-            # W&B artifact — download
             print(f"downloading artifact: {resume_path}")
             artifact = wandb.use_artifact(resume_path, type="model")
             artifact_dir = artifact.download()
             pt_files = glob.glob(os.path.join(artifact_dir, "*.pt"))
-            assert pt_files, f"No .pt files found in artifact {resume_path}"
+            assert pt_files
             ckpt_path = pt_files[0]
         else:
             ckpt_path = resume_path
-
         trainer.load_checkpoint(ckpt_path)
 
-    # ── train ──
     trainer.fit()
 
-    # ── post-training benchmark ──
     print("\n" + "=" * 60)
-    print("post-training benchmark")
+    print("post-training benchmark evaluation")
     print("=" * 60)
-    m = trainer.validate_benchmark(valid_dl, "Set5")
-    print(f"  Set5 — PSNR(Y): {m['psnr']:.2f}dB | SSIM(Y): {m['ssim']:.4f}")
+    m = trainer.validate_benchmark(valid_dl, "Urban100")
+    print(f"  Urban100 — PSNR(Y): {m['psnr']:.2f}dB | SSIM(Y): {m['ssim']:.4f}")
 
     wandb.finish()
     print("\ndone.")
-
 
 if __name__ == "__main__":
     main()
