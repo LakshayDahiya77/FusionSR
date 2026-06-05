@@ -19,22 +19,41 @@ from data.datasets import make_train_dl, make_benchmark_dl, generate_lr_on_gpu
 # ─────────────────────────────────────────────────────────────────────────────
 
 class UnifiedHRDataset(Dataset):
-    """Memory-safe dataset class for streaming massive HR-only folders."""
-    def __init__(self, root_dir, patch_size=128, scale=4):
+    """Memory-safe dataset class for streaming massive HR-only folders with precise count filtering."""
+    def __init__(self, root_dir, patch_size=128, scale=4, filters=None):
         self.root_dir = root_dir
         self.patch_size = patch_size
         self.scale = scale
         self.patch_hr = patch_size * scale
         
-        # Collect all images matching common extensions
-        self.img_paths = []
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.png"):
-            self.img_paths.extend(glob.glob(os.path.join(root_dir, ext)))
-            self.img_paths.extend(glob.glob(os.path.join(root_dir, ext.upper())))
+        raw_paths = []
+        for ext in ("*.jpg", "*.jpeg", "*.png"):
+            raw_paths.extend(glob.glob(os.path.join(root_dir, '**', ext), recursive=True))
+            raw_paths.extend(glob.glob(os.path.join(root_dir, '**', ext.upper()), recursive=True))
         
-        self.img_paths = sorted(list(set(self.img_paths)))
+        # Apply Dictionary-based Filtering with Limits
+        if filters and isinstance(filters, dict):
+            filtered_paths = []
+            for filter_str, max_limit in filters.items():
+                f_lower = filter_str.lower()
+                # Find all matching files and sort them deterministically
+                matches = sorted([p for p in raw_paths if f_lower in os.path.basename(p).lower()])
+                
+                # Apply the specific cutoff limit if one is provided
+                if max_limit is not None:
+                    matches = matches[:max_limit]
+                    
+                filtered_paths.extend(matches)
+            
+            # Remove potential duplicates while preserving order
+            self.img_paths = list(dict.fromkeys(filtered_paths))
+        else:
+            self.img_paths = sorted(list(set(raw_paths)))
+            
         if len(self.img_paths) == 0:
-            raise RuntimeError(f"No images found in unified directory: {root_dir}")
+            raise RuntimeError(f"No images found matching filters {filters} in {root_dir}")
+        else:
+            print(f"UnifiedHRDataset initialized with {len(self.img_paths)} total images.")
 
     def __len__(self):
         return len(self.img_paths)
@@ -46,18 +65,14 @@ class UnifiedHRDataset(Dataset):
                 img = img.convert("RGB")
                 w, h = img.size
                 
-                # Guard against rare ultra-small source images
                 if w < self.patch_hr or h < self.patch_hr:
-                    # Fallback to center resizing if smaller than patch requirement
                     img = img.resize((max(w, self.patch_hr), max(h, self.patch_hr)), Image.BICUBIC)
                     w, h = img.size
 
-                # Storage-safe parsing: crop region BEFORE loading whole image arrays into RAM
                 x0 = random.randint(0, w - self.patch_hr)
                 y0 = random.randint(0, h - self.patch_hr)
                 cropped_img = img.crop((x0, y0, x0 + self.patch_hr, y0 + self.patch_hr))
                 
-                # Data augmentation
                 if random.random() > 0.5:
                     cropped_img = cropped_img.transpose(Image.FLIP_LEFT_RIGHT)
                 rot = random.choice([0, 90, 180, 270])
@@ -70,8 +85,7 @@ class UnifiedHRDataset(Dataset):
                 hr_tensor = hr_tensor.permute(2, 0, 1).float() / 255.0
                 return hr_tensor
         except Exception as e:
-            # Fallback to index 0 on corrupted images to safeguard long training runs
-            return self.__getitem__(0)
+            return self.__getitem__(random.randint(0, len(self.img_paths) - 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
