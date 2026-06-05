@@ -242,8 +242,8 @@ def make_train_dl(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=True,       # Keeps CPU cores alive between epochs
+        prefetch_factor=4,             # Each CPU core prepares 4 batches in advance
     )
 
 
