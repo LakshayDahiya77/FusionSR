@@ -7,7 +7,7 @@ import random
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-
+import numpy as np
 from models.fusionsr import FusionSR, count_parameters
 from models.losses import CombinedSRLoss
 from training.trainer import Trainer
@@ -79,9 +79,7 @@ class UnifiedHRDataset(Dataset):
                 if rot != 0:
                     cropped_img = cropped_img.rotate(rot)
                 
-                hr_tensor = torch.from_numpy(
-                    copy.deepcopy(torch.ByteStorage.from_buffer(cropped_img.tobytes()).numpy())
-                ).view(self.patch_hr, self.patch_hr, 3)
+                hr_tensor = torch.from_numpy(np.array(cropped_img, dtype=np.uint8, copy=True))
                 hr_tensor = hr_tensor.permute(2, 0, 1).float() / 255.0
                 return hr_tensor
         except Exception as e:
