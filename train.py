@@ -12,12 +12,6 @@ from models.fusionsr import FusionSR, count_parameters
 from models.losses import CombinedSRLoss
 from training.trainer import Trainer
 from data.datasets import make_train_dl, make_benchmark_dl, generate_lr_on_gpu
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  UNIFIED DATASET STORAGE PIPELINE (RAM-SAFE)
-# ─────────────────────────────────────────────────────────────────────────────
-
 import io
 
 class UnifiedHRDataset(Dataset):
@@ -96,10 +90,6 @@ class UnifiedHRDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self.img_paths) - 1))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-
 CONFIG = {
     "channels": 180,
     "num_groups": 6,
@@ -125,21 +115,14 @@ CONFIG = {
     "compile_mode": "max-autotune",
     "compile_fullgraph": False,
     "compile_dynamic": False,
-    
-    # EMA settings
     "use_ema": False,
     "ema_decay": 0.999,
-    
-    # Dataset routing toggles
     "use_unified_dataset": False,
     "unified_hr_dir": "",
-    
-    # Traditional split fallbacks
     "train_hr_dirs": [],
     "train_lr_dirs": [],
     "val_hr_dir": "",
     "val_lr_dir": "",
-    
     "wandb_entity": "lakshay_dahiya77",
     "wandb_project": "FusionSR-v4",
     "wandb_run": "v4-phase1",
@@ -187,7 +170,6 @@ def main():
     assert config["val_hr_dir"], "Validation paths are mandatory."
     assert config["val_lr_dir"], "Validation paths are mandatory."
 
-    # Routing Dataloaders via flag
     if config.get("use_unified_dataset", False):
         print(f"Initializing Unified Storage-backed stream from: {config['unified_hr_dir']}")
         train_ds = UnifiedHRDataset(
@@ -256,12 +238,9 @@ def main():
         betas=(0.9, 0.999),
     )
 
-    # Intercepting training iterations for HR-only batches to step generation on GPU
     if config.get("use_unified_dataset", False):
         class UnifiedStepTrainer(Trainer):
-            # FIXED: Removed 'epoch' from the arguments
             def train_epoch(self): 
-                # Custom processing loop wrapper that generates LR targets on GPU dynamically
                 self.model.train()
                 epoch_loss = 0.0
                 for batch_idx, hr_tensors in enumerate(self.train_dl):
@@ -270,16 +249,21 @@ def main():
                     
                     self.optimizer.zero_grad(set_to_none=True)
                     
-                    with torch.autocast("cuda", dtype=torch.bfloat16): # Added autocast for speed
+                    with torch.autocast("cuda", dtype=self.amp_dtype): 
                         pred = self.model(lr_tensors)
                         loss, loss_dict = self.loss_fn(pred, hr_tensors)
                         
-                    loss.backward()
+                    self.scaler.scale(loss).backward()
                     
                     if self.config["grad_clip"] > 0:
+                        self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config["grad_clip"])
                     
-                    self.optimizer.step()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    
+                    if self.scheduler is not None:
+                        self.scheduler.step()
                     
                     if hasattr(self, "ema_model") and self.ema_model is not None:
                         self.ema_model.update_parameters(self.model)
