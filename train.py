@@ -239,6 +239,10 @@ def main():
 
     print(f"parameters: {count_parameters(model) / 1e6:.2f}M")
 
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = torch.nn.DataParallel(model)
+
     ema_model = None
     if config.get("use_ema", False):
         ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(config["ema_decay"]))

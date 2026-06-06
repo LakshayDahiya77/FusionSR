@@ -177,9 +177,11 @@ class Trainer:
     def save_checkpoint(self, epoch: int, metrics: dict, tag: str = "latest"):
         path = os.path.join(self.save_dir, f"fusionsr_{tag}.pt")
 
+        model_to_save = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
         ckpt = {
             "epoch": epoch,
-            "model": self.model.state_dict(),
+            "model": model_to_save.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler": self.scaler.state_dict(),
@@ -201,7 +203,8 @@ class Trainer:
     def load_checkpoint(self, path: str):
         """Load model weights from checkpoint. Scheduler/optimizer are fresh."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt["model"])
+        model_to_load = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        model_to_load.load_state_dict(ckpt["model"])
 
         # always start fresh — epoch and LR come from config, not checkpoint
         self.start_epoch = self.config["start_epoch"]
