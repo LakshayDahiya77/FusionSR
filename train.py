@@ -92,7 +92,7 @@ class UnifiedHRDataset(Dataset):
 
 CONFIG = {
     # ── v5 architecture ──
-    "channels": 168,
+    "channels": 162,
     "num_groups": 8,
     "num_heads": 6,
     "scale": 4,

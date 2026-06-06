@@ -1,10 +1,10 @@
 """
 FusionSR-v5 — Novel Hybrid Architecture for 4× Super-Resolution.
 
-Architecture (~14.5M params):
+Architecture (~14.0M params):
 
     Stage 1 — Shallow Extractor:
-        Single Conv2d(3→168, 3×3).
+        Single Conv2d(3→162, 3×3).
 
     Stage 2 — Deep Feature Extraction (8 residual groups):
         Each group: HFEB → MultiScaleWindowGroup(4 HybridSwinBlocks) → Conv → skip
@@ -27,7 +27,7 @@ Safe mode flags:
     component and falls back to a standard/safe equivalent.
 
 Changes from v4:
-    - channels: 180 → 168
+    - channels: 180 → 162
     - num_groups: 6 → 8
     - RCAB×6 per group → HFEB (58× cheaper)
     - CAB → removed (channel attention now inside each block)
@@ -51,7 +51,7 @@ class FusionSR(nn.Module):
         self,
         in_channels: int = 3,
         out_channels: int = 3,
-        channels: int = 168,
+        channels: int = 162,
         num_groups: int = 8,
         num_heads: int = 6,
         scale: int = 4,

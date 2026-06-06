@@ -61,7 +61,7 @@ V4_CONFIG = {
 V5_CONFIG = {
     "in_channels": 3,
     "out_channels": 3,
-    "channels": 168,
+    "channels": 162,
     "num_groups": 8,
     "num_heads": 6,
     "scale": 4,
