@@ -192,6 +192,9 @@ class BenchmarkDataset(Dataset):
     def __getitem__(self, idx):
         hr_path = self.hr_files[idx]
         lr_path = self.lr_dir / hr_path.name
+        if not lr_path.exists():
+            # Support DIV2K/Urban100 standard format where LR files have x4 suffix
+            lr_path = self.lr_dir / f"{hr_path.stem}x4{hr_path.suffix}"
 
         hr = np.array(Image.open(hr_path).convert("RGB"), dtype=np.uint8)
         lr = np.array(Image.open(lr_path).convert("RGB"), dtype=np.uint8)
