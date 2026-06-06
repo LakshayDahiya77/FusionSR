@@ -307,11 +307,11 @@ class HybridSwinBlock(nn.Module):
 
         # ── attention branch (BHWC) ──
         x_bhwc = x.permute(0, 2, 3, 1)  # [B, H, W, C]
-        shortcut = x_bhwc
         x_bhwc = self.norm1(x_bhwc)
 
         # cyclic shift for SW-MSA
         if self.shift_size > 0:
+            x_bhwc = x_bhwc.contiguous()
             x_bhwc = torch.roll(
                 x_bhwc, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)
             ).contiguous()
@@ -325,6 +325,7 @@ class HybridSwinBlock(nn.Module):
 
         # reverse cyclic shift
         if self.shift_size > 0:
+            x_bhwc = x_bhwc.contiguous()
             x_bhwc = torch.roll(
                 x_bhwc, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
             ).contiguous()
