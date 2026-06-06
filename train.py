@@ -91,15 +91,24 @@ class UnifiedHRDataset(Dataset):
 
 
 CONFIG = {
-    "channels": 180,
-    "num_groups": 6,
-    "num_rcab": 6,
-    "window_size": 16,
+    # ── v5 architecture ──
+    "channels": 168,
+    "num_groups": 8,
     "num_heads": 6,
     "scale": 4,
     "ffn_expansion": 2.0,
-    "oca_overlap": 4,
-    "total_epochs": 150,
+    # Safe mode flags — disable to fall back to standard equivalents
+    "use_hfeb": True,        # False → identity passthrough (no HF emphasis)
+    "use_hybrid_ca": True,   # False → standard SwinBlock residual (no channel gate)
+    "use_mswa": True,        # False → uniform ws=8 (no multi-scale)
+    "use_tdca": True,        # False → skip dictionary cross-attention entirely
+    # TDCA config
+    "tdca_num_tokens": 64,
+    "tdca_interval": 2,      # insert TDCA every N groups
+    # HFEB config
+    "hf_scale_init": 0.01,
+    # ── training ──
+    "total_epochs": 50,
     "start_epoch": 0,
     "lr_max": 3e-4,
     "batch_size": 16,
@@ -107,7 +116,7 @@ CONFIG = {
     "num_workers": 4,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
-    "warmup_epochs": 8,
+    "warmup_epochs": 5,
     "min_lr": 1e-7,
     "allow_tf32": True,
     "matmul_precision": "high",
@@ -124,8 +133,8 @@ CONFIG = {
     "val_hr_dir": "",
     "val_lr_dir": "",
     "wandb_entity": "lakshay_dahiya77",
-    "wandb_project": "FusionSR-v4",
-    "wandb_run": "v4-phase1",
+    "wandb_project": "FusionSR-v5",
+    "wandb_run": "v5-phase1",
     "wandb_run_id": None,
     "resume": None,
     "save_dir": "/content/checkpoints",
@@ -208,12 +217,16 @@ def main():
     model = FusionSR(
         channels=config["channels"],
         num_groups=config["num_groups"],
-        num_rcab=config["num_rcab"],
-        window_size=config["window_size"],
         num_heads=config["num_heads"],
         scale=config["scale"],
         ffn_expansion=config["ffn_expansion"],
-        oca_overlap=config["oca_overlap"],
+        use_hfeb=config.get("use_hfeb", True),
+        use_hybrid_ca=config.get("use_hybrid_ca", True),
+        use_mswa=config.get("use_mswa", True),
+        use_tdca=config.get("use_tdca", True),
+        tdca_num_tokens=config.get("tdca_num_tokens", 64),
+        tdca_interval=config.get("tdca_interval", 2),
+        hf_scale_init=config.get("hf_scale_init", 0.01),
     ).to(device)
 
     if config.get("use_compile", False) and hasattr(torch, "compile"):

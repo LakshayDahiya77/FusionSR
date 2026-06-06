@@ -58,6 +58,17 @@ V4_CONFIG = {
     "oca_overlap": 4,
 }
 
+V5_CONFIG = {
+    "in_channels": 3,
+    "out_channels": 3,
+    "channels": 168,
+    "num_groups": 8,
+    "num_heads": 6,
+    "scale": 4,
+    "ffn_expansion": 2.0,
+    "window_size": 8,  # used by run_model() for external padding
+}
+
 CLASSICAL_BENCHMARKS = {
     "Set5": (
         f"{BENCH_BASE}/Set5/Set5/GTmod12",
@@ -369,13 +380,15 @@ def main(args):
 
     def resolve_config(default_version: str, checkpoint: str | None) -> dict:
         version = args.version or default_version
-        if version == "v4" and checkpoint in ("classical", "satellite"):
-            raise ValueError("HF 'classical'/'satellite' checkpoints are v2; use --version v2 or a v4 checkpoint")
+        if version in ("v4", "v5") and checkpoint in ("classical", "satellite"):
+            raise ValueError("HF 'classical'/'satellite' checkpoints are v2; use --version v2 or a v4/v5 checkpoint")
         if version == "v2":
             return V2_CONFIG
         if version == "v4":
             return V4_CONFIG
-        raise ValueError("--version must be 'v2' or 'v4'")
+        if version == "v5":
+            return V5_CONFIG
+        raise ValueError("--version must be 'v2', 'v4', or 'v5'")
 
 
     models_to_eval = []
@@ -444,7 +457,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
-        choices=["v2", "v4"],
+        choices=["v2", "v4", "v5"],
         default=None,
         help="model version (defaults to v2 for HF models)",
     )

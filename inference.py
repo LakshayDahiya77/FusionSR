@@ -41,6 +41,17 @@ V4_CONFIG = {
     "oca_overlap": 4,
 }
 
+V5_CONFIG = {
+    "in_channels": 3,
+    "out_channels": 3,
+    "channels": 168,
+    "num_groups": 8,
+    "num_heads": 6,
+    "scale": 4,
+    "ffn_expansion": 2.0,
+    "window_size": 8,  # used for external padding calculation
+}
+
 def load_model(
     model_identifier: str,
     device: torch.device,
@@ -103,8 +114,11 @@ def main(args):
 
     if args.version == "v2" or (args.version is None and args.model in ["classical", "satellite"]):
         model_config = V2_CONFIG
-    else:
+    elif args.version == "v4":
         model_config = V4_CONFIG
+    else:
+        # Default to v5 for local checkpoints
+        model_config = V5_CONFIG
 
     # load model
     print(f"loading checkpoint: {ckpt_path}")
@@ -165,9 +179,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         type=str,
-        choices=["v2", "v4"],
+        choices=["v2", "v4", "v5"],
         default=None,
-        help="model version to use (defaults: v2 for HF models, v4 otherwise)",
+        help="model version to use (defaults: v2 for HF models, v5 otherwise)",
     )
     parser.add_argument(
         "--checkpoint",
