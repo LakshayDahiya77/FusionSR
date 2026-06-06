@@ -104,7 +104,7 @@ class FusionSR(nn.Module):
                 self.tdca_layers[str(i)] = TokenDictionaryCrossAttention(
                     channels=channels,
                     num_tokens=tdca_num_tokens,
-                    num_heads=min(num_heads, 4),  # TDCA uses fewer heads
+                    num_heads=num_heads,  # use same number of heads to ensure divisibility (162 % 6 == 0)
                 )
 
         self.body_conv = nn.Conv2d(channels, channels, 3, padding=1, bias=True)
