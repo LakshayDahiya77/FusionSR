@@ -290,6 +290,12 @@ def main():
             train_dl=train_dl, valid_dl=valid_dl, config=config,
             device=device, save_dir=config["save_dir"]
         )
+    else:
+        trainer = Trainer(
+            model=model, loss_fn=loss_fn, optimizer=optimizer,
+            train_dl=train_dl, valid_dl=valid_dl, config=config,
+            device=device, save_dir=config["save_dir"]
+        )
 
     if ema_model is not None:
         trainer.ema_model = ema_model
