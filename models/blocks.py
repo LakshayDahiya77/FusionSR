@@ -442,11 +442,8 @@ class MultiScaleWindowGroup(nn.Module):
     def _get_mask(
         self, H: int, W: int, window_size: int, device: torch.device
     ) -> torch.Tensor:
-        """Get or compute cached shift mask for a given spatial size + window size."""
-        key = (H, W, window_size)
-        if key not in self._masks:
-            self._masks[key] = self._compute_mask(H, W, window_size, device)
-        return self._masks[key].to(device)
+        """Compute shift mask for a given spatial size + window size."""
+        return self._compute_mask(H, W, window_size, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, H, W = x.shape
