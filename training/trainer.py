@@ -127,8 +127,10 @@ class Trainer:
             with torch.autocast("cuda", dtype=self.amp_dtype):
                 pred = self.model(lr_imgs).float().clamp(0, 1)
 
-            # crop to original HR size (model handles window padding)
-            hr_h, hr_w = hr_imgs.shape[-2], hr_imgs.shape[-1]
+            # ensure HR shape perfectly matches the scaled LR shape (fixes un-cropped HR datasets)
+            lr_h, lr_w = lr_imgs.shape[-2], lr_imgs.shape[-1]
+            hr_h, hr_w = lr_h * scale, lr_w * scale
+            hr_imgs = hr_imgs[:, :, :hr_h, :hr_w]
             pred = pred[:, :, :hr_h, :hr_w]
 
             # boundary crop — standard SR evaluation (remove `scale` pixels)
