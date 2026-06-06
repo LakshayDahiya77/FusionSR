@@ -223,6 +223,10 @@ class WindowAttention(nn.Module):
             attn_mask = (bias + mask.repeat(B, 1, 1).unsqueeze(1)).contiguous()
         else:
             attn_mask = bias
+        
+        # ensure mask matches query dtype (crucial for AMP float16)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=q.dtype)
 
         # fused attention: Q·K^T scaling + mask + softmax + V in one kernel
         x = F.scaled_dot_product_attention(
@@ -330,7 +334,7 @@ class HybridSwinBlock(nn.Module):
         # Channel attention gate (HAT-style hybrid attention)
         if self.use_hybrid_ca:
             gate = self.channel_gate(attn_out)  # [B, C, 1, 1]
-            attn_out = attn_out * gate
+            attn_out = (attn_out * gate).contiguous()
 
         # attention skip (in BCHW)
         x = x + attn_out
