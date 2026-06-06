@@ -158,7 +158,7 @@ def window_partition(x: torch.Tensor, window_size: int):
     """
     B, H, W, C = x.shape
     x = x.reshape(B, H // window_size, window_size, W // window_size, window_size, C)
-    return x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size, window_size, C)
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(-1, window_size, window_size, C)
 
 
 def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
@@ -168,7 +168,7 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
     nW = (H // window_size) * (W // window_size)
     B = windows.shape[0] // nW
     x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
-    return x.permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, -1)
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, H, W, -1)
 
 
 class WindowAttention(nn.Module):
@@ -208,7 +208,7 @@ class WindowAttention(nn.Module):
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()
         q, k, v = qkv.unbind(0)  # each [B_, num_heads, N, head_dim]
 
         # relative position bias: [1, num_heads, N, N]
@@ -228,7 +228,7 @@ class WindowAttention(nn.Module):
         x = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, scale=self.scale
         )
-        x = x.transpose(1, 2).reshape(B_, N, C)
+        x = x.transpose(1, 2).contiguous().reshape(B_, N, C)
         return self.proj(x)
 
 
@@ -524,15 +524,15 @@ class TokenDictionaryCrossAttention(nn.Module):
         V = self.v_proj(dict_expanded)  # [B, K, C]
 
         # Reshape for multi-head attention
-        Q = Q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.reshape(B, self.num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.reshape(B, self.num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = Q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        K = K.reshape(B, self.num_tokens, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        V = V.reshape(B, self.num_tokens, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         # Q: [B, H, N, D], K: [B, H, K, D], V: [B, H, K, D]
 
         # Fused scaled dot-product cross-attention
         out = F.scaled_dot_product_attention(Q, K, V, scale=self.scale)
         # out: [B, H, N, D]
-        out = out.transpose(1, 2).reshape(B, N, C)
+        out = out.transpose(1, 2).contiguous().reshape(B, N, C)
         out = self.out_proj(out)
 
         # Residual connection and reshape back to BCHW
