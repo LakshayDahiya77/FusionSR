@@ -229,9 +229,10 @@ class WindowAttention(nn.Module):
             attn_mask = attn_mask.to(dtype=q.dtype)
 
         # fused attention: Q·K^T scaling + mask + softmax + V in one kernel
-        x = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, scale=self.scale
-        )
+        with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=self.scale
+            )
         x = x.transpose(1, 2).contiguous().reshape(B_, N, C)
         return self.proj(x)
 
@@ -534,7 +535,8 @@ class TokenDictionaryCrossAttention(nn.Module):
         # Q: [B, H, N, D], K: [B, H, K, D], V: [B, H, K, D]
 
         # Fused scaled dot-product cross-attention
-        out = F.scaled_dot_product_attention(Q, K, V, scale=self.scale)
+        with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+            out = F.scaled_dot_product_attention(Q, K, V, scale=self.scale)
         # out: [B, H, N, D]
         out = out.transpose(1, 2).contiguous().reshape(B, N, C)
         out = self.out_proj(out)
