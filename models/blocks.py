@@ -213,14 +213,14 @@ class WindowAttention(nn.Module):
 
         # relative position bias: [1, num_heads, N, N]
         bias = self.rel_pos_bias_table[self.rel_pos_index.view(-1)]
-        bias = bias.reshape(N, N, self.num_heads).permute(2, 0, 1).unsqueeze(0)
+        bias = bias.reshape(N, N, self.num_heads).permute(2, 0, 1).unsqueeze(0).contiguous()
 
         # combine bias with shift mask for fused SDPA kernel
         if mask is not None:
             nW = mask.shape[0]
             B = B_ // nW
             # mask [nW, N, N] → tile across batch → [B*nW, 1, N, N]
-            attn_mask = bias + mask.repeat(B, 1, 1).unsqueeze(1)
+            attn_mask = (bias + mask.repeat(B, 1, 1).unsqueeze(1)).contiguous()
         else:
             attn_mask = bias
 
@@ -309,7 +309,7 @@ class HybridSwinBlock(nn.Module):
         if self.shift_size > 0:
             x_bhwc = torch.roll(
                 x_bhwc, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)
-            )
+            ).contiguous()
 
         # window partition → attention → window reverse
         windows = window_partition(x_bhwc, self.window_size)
@@ -322,10 +322,10 @@ class HybridSwinBlock(nn.Module):
         if self.shift_size > 0:
             x_bhwc = torch.roll(
                 x_bhwc, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
-            )
+            ).contiguous()
 
         # Convert to BCHW for channel gate
-        attn_out = x_bhwc.permute(0, 3, 1, 2)  # [B, C, H, W]
+        attn_out = x_bhwc.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
 
         # Channel attention gate (HAT-style hybrid attention)
         if self.use_hybrid_ca:
@@ -431,7 +431,7 @@ class MultiScaleWindowGroup(nn.Module):
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0)
         attn_mask = attn_mask.masked_fill(attn_mask == 0, 0.0)
-        return attn_mask
+        return attn_mask.contiguous()
 
     def _get_mask(
         self, H: int, W: int, window_size: int, device: torch.device
