@@ -442,10 +442,10 @@ class MultiScaleWindowGroup(nn.Module):
         self, H: int, W: int, window_size: int, device: torch.device
     ) -> torch.Tensor:
         """Get or compute cached shift mask for a given spatial size + window size."""
-        key = (H, W, window_size, device)
+        key = (H, W, window_size)
         if key not in self._masks:
             self._masks[key] = self._compute_mask(H, W, window_size, device)
-        return self._masks[key]
+        return self._masks[key].to(device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, H, W = x.shape
@@ -524,7 +524,7 @@ class TokenDictionaryCrossAttention(nn.Module):
         Q = self.q_proj(x_norm)
 
         # K, V from dictionary: [K, C] → explicitly expand to [B, K, C]
-        dict_expanded = self.dictionary.unsqueeze(0).expand(B, -1, -1)  # [B, K, C]
+        dict_expanded = self.dictionary.unsqueeze(0).expand(B, -1, -1).contiguous()  # [B, K, C]
         K = self.k_proj(dict_expanded)  # [B, K, C]
         V = self.v_proj(dict_expanded)  # [B, K, C]
 
