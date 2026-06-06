@@ -1,6 +1,16 @@
 import os
 import copy
 import glob
+import time
+import json
+import logging
+import warnings
+
+# Suppress PyTorch 2.x compilation verbosity
+os.environ["TORCH_LOGS"] = "-all"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._inductor.*")
+
 import torch
 import wandb
 import random
