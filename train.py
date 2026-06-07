@@ -237,6 +237,7 @@ def main():
         tdca_num_tokens=config.get("tdca_num_tokens", 64),
         tdca_interval=config.get("tdca_interval", 2),
         hf_scale_init=config.get("hf_scale_init", 0.01),
+        use_checkpoint=config.get("use_checkpoint", False),
     ).to(device)
 
     if config.get("use_compile", False) and hasattr(torch, "compile"):

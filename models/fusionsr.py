@@ -41,6 +41,7 @@ Changes from v4:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 from models.blocks import ResidualGroup, TokenDictionaryCrossAttention
 
 
@@ -66,10 +67,13 @@ class FusionSR(nn.Module):
         tdca_interval: int = 2,  # insert TDCA every N groups
         # HFEB config
         hf_scale_init: float = 0.01,
+        # Checkpointing
+        use_checkpoint: bool = False,
         # Legacy kwargs (ignored, for backward compat with evaluate/inference configs)
         **kwargs,
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.scale = scale
         # Hardcoded to LCM of all window sizes (4, 8) = 8
         # This ensures _pad_to_window works correctly at inference on
@@ -165,10 +169,18 @@ class FusionSR(nn.Module):
         # Stage 2 — deep feature extraction with TDCA
         deep = shallow
         for i, group in enumerate(self.groups):
-            deep = group(deep)
+            if self.use_checkpoint and deep.requires_grad:
+                deep = checkpoint.checkpoint(group, deep, use_reentrant=False)
+            else:
+                deep = group(deep)
+                
             # Apply TDCA after designated groups
             if self.use_tdca and str(i) in self.tdca_layers:
-                deep = self.tdca_layers[str(i)](deep)
+                tdca = self.tdca_layers[str(i)]
+                if self.use_checkpoint and deep.requires_grad:
+                    deep = checkpoint.checkpoint(tdca, deep, use_reentrant=False)
+                else:
+                    deep = tdca(deep)
 
         deep = self.body_conv(deep)
 
