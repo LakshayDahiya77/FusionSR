@@ -209,7 +209,10 @@ class Trainer:
     def load_checkpoint(self, path: str):
         """Load model weights from checkpoint. Scheduler/optimizer are fresh."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        model_to_load = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        # Unwrap DDP/DataParallel to load into the base model
+        model_to_load = self.model
+        if hasattr(model_to_load, "module"):
+            model_to_load = model_to_load.module
         model_to_load.load_state_dict(ckpt["model"])
 
         # always start fresh — epoch and LR come from config, not checkpoint

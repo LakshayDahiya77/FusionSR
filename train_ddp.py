@@ -95,6 +95,39 @@ def main():
         hf_scale_init=config.get("hf_scale_init", 0.01),
     ).to(device)
 
+    # ── Load checkpoint BEFORE DDP wrapping so all ranks get same weights ──
+    if config.get("resume"):
+        ckpt_path = None
+        if is_master:
+            resume_path = config["resume"]
+            if "/" in resume_path:
+                import glob as glob_mod
+                artifact = wandb.use_artifact(resume_path, type="model")
+                artifact_dir = artifact.download()
+                pt_files = glob_mod.glob(os.path.join(artifact_dir, "*.pt"))
+                assert pt_files, f"No .pt files found in {artifact_dir}"
+                ckpt_path = pt_files[0]
+            else:
+                ckpt_path = resume_path
+
+        # Broadcast checkpoint path from master to all ranks
+        path_list = [ckpt_path]
+        dist.broadcast_object_list(path_list, src=0)
+        ckpt_path = path_list[0]
+
+        # All ranks load the checkpoint into the base model
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        start_epoch = config.get("start_epoch", 0)
+        if is_master:
+            m = ckpt.get("metrics", {})
+            print(f"── checkpoint loaded ──")
+            print(f"  source epoch: {ckpt.get('epoch', '?')}")
+            print(f"  PSNR (Y): {m.get('psnr', 'N/A')}")
+            print(f"  start_epoch: {start_epoch}")
+        del ckpt  # free memory
+
+    # Wrap with DDP AFTER loading weights
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if is_master:
@@ -110,7 +143,6 @@ def main():
     )
 
     # ── Trainer ──
-    # Pass sampler so trainer can call sampler.set_epoch() each epoch
     trainer = Trainer(
         model=model,
         loss_fn=loss_fn,
@@ -123,21 +155,6 @@ def main():
         is_master=is_master,
         sampler=sampler,
     )
-
-    if config.get("resume"):
-        if is_master:
-            resume_path = config["resume"]
-            if "/" in resume_path:
-                import glob
-                artifact = wandb.use_artifact(resume_path, type="model")
-                artifact_dir = artifact.download()
-                pt_files = glob.glob(os.path.join(artifact_dir, "*.pt"))
-                assert pt_files
-                ckpt_path = pt_files[0]
-            else:
-                ckpt_path = resume_path
-            trainer.load_checkpoint(ckpt_path)
-        dist.barrier()  # all ranks wait for master to load
 
     trainer.fit()
 
