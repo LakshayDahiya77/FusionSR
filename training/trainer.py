@@ -293,6 +293,10 @@ class Trainer:
                 val_psnr = metrics["psnr"]
                 val_ssim = metrics["ssim"]
 
+                import psutil
+                vram_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                ram_gb = psutil.virtual_memory().used / (1024**3)
+
                 # ── log to W&B ──
                 log_dict = {
                     "train/loss": train_loss,
@@ -301,8 +305,11 @@ class Trainer:
                     "val/ssim_y": val_ssim,
                     "time/train": train_time,
                     "time/val": val_time,
+                    "system/vram_peak_gb": vram_gb,
+                    "system/ram_used_gb": ram_gb,
                     "epoch": epoch,
                 }
+                torch.cuda.reset_peak_memory_stats()
                 wandb.log(log_dict)
 
                 # log visual samples every epoch
@@ -323,6 +330,7 @@ class Trainer:
                     f"epoch {epoch:4d} | loss {train_loss:.4f} | "
                     f"PSNR(Y) {val_psnr:.2f}dB | SSIM(Y) {val_ssim:.4f} | "
                     f"train {train_time:.0f}s | val {val_time:.0f}s | "
+                    f"VRAM {vram_gb:.1f}G | RAM {ram_gb:.1f}G | "
                     f"LR {current_lr:.2e}{best_marker}"
                 )
 
