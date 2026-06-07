@@ -213,7 +213,11 @@ class Trainer:
         model_to_load = self.model
         if hasattr(model_to_load, "module"):
             model_to_load = model_to_load.module
-        model_to_load.load_state_dict(ckpt["model"])
+        
+        state_dict = ckpt["model"]
+        if list(state_dict.keys())[0].startswith("module."):
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model_to_load.load_state_dict(state_dict)
 
         # always start fresh — epoch and LR come from config, not checkpoint
         self.start_epoch = self.config["start_epoch"]

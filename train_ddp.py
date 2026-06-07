@@ -117,7 +117,10 @@ def main():
 
         # All ranks load the checkpoint into the base model
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        state_dict = ckpt["model"]
+        if list(state_dict.keys())[0].startswith("module."):
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
         start_epoch = config.get("start_epoch", 0)
         if is_master:
             m = ckpt.get("metrics", {})
