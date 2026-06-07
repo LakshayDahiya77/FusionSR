@@ -36,6 +36,8 @@ class Trainer:
         config: dict,
         device: torch.device,
         save_dir: str = "/content/checkpoints",
+        is_master: bool = True,
+        sampler = None,
     ):
         self.model = model
         self.loss_fn = loss_fn
@@ -45,6 +47,8 @@ class Trainer:
         self.config = config
         self.device = device
         self.save_dir = save_dir
+        self.is_master = is_master
+        self.sampler = sampler
 
         self.grad_clip = config.get("grad_clip", 1.0)
 
@@ -263,6 +267,9 @@ class Trainer:
         print("-" * 60)
 
         for epoch in range(self.start_epoch, total_epochs):
+            if self.sampler is not None:
+                self.sampler.set_epoch(epoch)
+
             current_lr = self.optimizer.param_groups[0]["lr"]
 
             # ── train ──
@@ -270,46 +277,47 @@ class Trainer:
             train_loss = self.train_epoch()
             train_time = time.time() - t0
 
-            # ── validate ──
-            t0 = time.time()
-            metrics = self.validate_benchmark(self.valid_dl, "Set5")
-            val_time = time.time() - t0
+            if self.is_master:
+                # ── validate ──
+                t0 = time.time()
+                metrics = self.validate_benchmark(self.valid_dl, "Set5")
+                val_time = time.time() - t0
 
-            val_psnr = metrics["psnr"]
-            val_ssim = metrics["ssim"]
+                val_psnr = metrics["psnr"]
+                val_ssim = metrics["ssim"]
 
-            # ── log to W&B ──
-            log_dict = {
-                "train/loss": train_loss,
-                "train/lr": current_lr,
-                "val/psnr_y": val_psnr,
-                "val/ssim_y": val_ssim,
-                "time/train": train_time,
-                "time/val": val_time,
-                "epoch": epoch,
-            }
-            wandb.log(log_dict)
+                # ── log to W&B ──
+                log_dict = {
+                    "train/loss": train_loss,
+                    "train/lr": current_lr,
+                    "val/psnr_y": val_psnr,
+                    "val/ssim_y": val_ssim,
+                    "time/train": train_time,
+                    "time/val": val_time,
+                    "epoch": epoch,
+                }
+                wandb.log(log_dict)
 
-            # log visual samples every epoch
-            if metrics.get("samples"):
-                self._log_samples(metrics["samples"])
+                # log visual samples every epoch
+                if metrics.get("samples"):
+                    self._log_samples(metrics["samples"])
 
-            # ── checkpoint ──
-            is_best = val_psnr > self.best_psnr
-            if is_best:
-                self.best_psnr = val_psnr
-                self.save_checkpoint(epoch, metrics, tag="best")
+                # ── checkpoint ──
+                is_best = val_psnr > self.best_psnr
+                if is_best:
+                    self.best_psnr = val_psnr
+                    self.save_checkpoint(epoch, metrics, tag="best")
 
-            self.save_checkpoint(epoch, metrics, tag="latest")
+                self.save_checkpoint(epoch, metrics, tag="latest")
 
-            # ── console output ──
-            best_marker = " ← best" if is_best else ""
-            print(
-                f"epoch {epoch:4d} | loss {train_loss:.4f} | "
-                f"PSNR(Y) {val_psnr:.2f}dB | SSIM(Y) {val_ssim:.4f} | "
-                f"train {train_time:.0f}s | val {val_time:.0f}s | "
-                f"LR {current_lr:.2e}{best_marker}"
-            )
+                # ── console output ──
+                best_marker = " ← best" if is_best else ""
+                print(
+                    f"epoch {epoch:4d} | loss {train_loss:.4f} | "
+                    f"PSNR(Y) {val_psnr:.2f}dB | SSIM(Y) {val_ssim:.4f} | "
+                    f"train {train_time:.0f}s | val {val_time:.0f}s | "
+                    f"LR {current_lr:.2e}{best_marker}"
+                )
 
         print("-" * 60)
         print(f"training complete. best PSNR(Y): {self.best_psnr:.2f}dB")
