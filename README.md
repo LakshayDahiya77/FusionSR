@@ -2,7 +2,7 @@
 
 **FusionSR-v5** is a lightweight hybrid architecture (~14M parameters) for **4× single image super-resolution**. It combines novel multi-scale windowed self-attention, explicit high-frequency enhancement, global token dictionary cross-attention, and integrated channel gating — achieving competitive results against heavier published models at significantly lower parameter cost.
 
-## 🎯 Key Results (4× Upscaling)
+## Key Results (4× Upscaling)
 
 | Model           | Params    | Set5 (PSNR / SSIM) | Set14 (PSNR / SSIM) | BSD100 (PSNR / SSIM) | Urban100 (PSNR / SSIM) | Manga109 (PSNR / SSIM) |
 | --------------- | --------- | ------------------ | ------------------- | -------------------- | ---------------------- | ---------------------- |
@@ -15,21 +15,37 @@
 
 > Results evaluated on Y-channel (YCbCr), boundary-cropped by scale factor, matching standard SR evaluation protocol.
 
+### Benchmark Results (FusionSR-v5)
+
+| Metric       | Set5 | Set14 | BSD100 | Urban100 | Manga109 |
+| ------------ | ---- | ----- | ------ | -------- | -------- |
+| **PSNR (Y)** | 32.38 dB | 28.82 dB | 27.72 dB | 26.54 dB | 30.99 dB |
+| **SSIM (Y)** | 0.9016   | 0.7938   | 0.7496   | 0.8025   | 0.9168   |
+
+### Qualitative Comparisons
+
+|   Dataset    | Visual Comparison: Low-Res (Left) vs. FusionSR-v4 Output (Middle) vs. Ground Truth (Right) |
+| :----------: | :----------------------------------------------------------------------------------------- |
+|   **Set5**   | <img src="images/Set5_Samples_0.png" width="800" alt="Set5 Benchmark Sample">              |
+|  **Set14**   | <img src="images/Set14_Samples_1.png" width="800" alt="Set14 Benchmark Sample">            |
+|  **BSD100**  | <img src="images/BSD100_Samples_2.png" width="800" alt="BSD100 Benchmark Sample">          |
+| **Urban100** | <img src="images/Urban100_Samples_4.png" width="800" alt="Urban100 Benchmark Sample">      |
+| **Manga109** | <img src="images/Manga109_Samples_3.png" width="800" alt="Manga109 Benchmark Sample">      |
+
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
-- [Architecture](#-architecture)
-- [Novel Components](#-novel-components)
-- [Datasets](#-datasets)
-- [Training Strategy](#-training-strategy)
-- [Results](#-results)
-- [Model Weights](#-model-weights)
-- [Installation & Usage](#-installation--usage)
+- [Architecture](#architecture)
+- [Novel Components](#novel-components)
+- [Datasets](#datasets)
+- [Training Strategy](#training-strategy)
+- [Model Weights](#model-weights)
+- [Installation & Usage](#installation--usage)
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ### Overview
 
@@ -84,7 +100,7 @@ x → LayerNorm → W/SW-MSA → ChannelGate(GAP→FC→GELU→Sigmoid) → ⊕ 
 
 ---
 
-## 🔬 Novel Components
+## Novel Components
 
 ### High-Frequency Enhancement Branch (HFEB)
 
@@ -104,7 +120,7 @@ Inspired by ATD (Li et al., CVPR 2024). A shared learnable token dictionary `D �
 
 ---
 
-## 📊 Datasets
+## Datasets
 
 ### Training Data
 
@@ -122,7 +138,7 @@ Urban100 is used as the primary validation benchmark during training, directly o
 
 ---
 
-## 🚂 Training Strategy
+## Training Strategy
 
 - **Optimizer:** AdamW (β₁=0.9, β₂=0.999, weight decay=0.01)
 - **Loss Function:** Charbonnier Loss (ε=1e-3)
@@ -133,33 +149,7 @@ Urban100 is used as the primary validation benchmark during training, directly o
 
 ---
 
-## 🔬 Benchmark Results
-
-All metrics computed on Y-channel (YCbCr), with boundary crop equal to scale factor (4 pixels per edge).
-
-| Benchmark    | PSNR (Y) | SSIM (Y) |
-| ------------ | -------- | -------- |
-| **Set5**     | 32.38 dB | 0.9016   |
-| **Set14**    | 28.82 dB | 0.7938   |
-| **BSD100**   | 27.72 dB | 0.7496   |
-| **Urban100** | 26.54 dB | 0.8025   |
-| **Manga109** | 30.99 dB | 0.9168   |
-
-### Qualitative Comparisons
-
-<!-- Insert benchmark comparison images below -->
-
-|   Dataset    | Visual Comparison: Low-Res (Left) vs. FusionSR-v4 Output (Middle) vs. Ground Truth (Right) |
-| :----------: | :----------------------------------------------------------------------------------------- |
-|   **Set5**   | <img src="images/Set5_Samples_0.png" width="800" alt="Set5 Benchmark Sample">              |
-|  **Set14**   | <img src="images/Set14_Samples_1.png" width="800" alt="Set14 Benchmark Sample">            |
-|  **BSD100**  | <img src="images/BSD100_Samples_2.png" width="800" alt="BSD100 Benchmark Sample">          |
-| **Urban100** | <img src="images/Urban100_Samples_4.png" width="800" alt="Urban100 Benchmark Sample">      |
-| **Manga109** | <img src="images/Manga109_Samples_3.png" width="800" alt="Manga109 Benchmark Sample">      |
-
----
-
-## 📦 Model Weights
+## Model Weights
 
 Pre-trained weights are hosted on Hugging Face:
 
@@ -169,7 +159,7 @@ Download `fusionsr-v5-best.pt` and place it in the project root before running i
 
 ---
 
-## 💻 Installation & Usage
+## Installation & Usage
 
 ### Setup
 
