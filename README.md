@@ -24,7 +24,7 @@
 
 ### Qualitative Comparisons
 
-|   Dataset    | Visual Comparison: Low-Res (Left) vs. FusionSR-v4 Output (Middle) vs. Ground Truth (Right) |
+|   Dataset    | Visual Comparison: Low-Res (Left) vs. FusionSR-v5 Output (Middle) vs. Ground Truth (Right) |
 | :----------: | :----------------------------------------------------------------------------------------- |
 |   **Set5**   | <img src="images/Set5_Samples_0.png" width="800" alt="Set5 Benchmark Sample">              |
 |  **Set14**   | <img src="images/Set14_Samples_1.png" width="800" alt="Set14 Benchmark Sample">            |
